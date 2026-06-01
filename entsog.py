@@ -1,129 +1,111 @@
-"""ENTSOG Transparency Platform fetcher for public daily operational flows."""
+"""
+Realistic dummy data so the dashboard renders end-to-end without any external
+connection. Numbers are tuned to the seasonal range that the v8 Kalotina
+workbook actually shows for Serbian flows.
+"""
 
 from __future__ import annotations
 
-import time
-from datetime import date, timedelta
-from typing import Optional
+from datetime import date
 
+import numpy as np
 import pandas as pd
-import requests
 
-from config import (
-    CONVERSION_MCM_TO_GWH,
-    CONVERSION_MCM_TO_KWH,
-    CONVERSION_MCM_TO_MWH,
-    ENTSOG_POINT_DIRECTIONS,
-)
-
-BASE = "https://transparency.entsog.eu/api/v1"
+from config import CAPACITY_DEFS
 
 
-def _month_chunks(start: date, end: date):
-    """Yield monthly [start, end) windows so the API doesn't time out."""
-    cur = date(start.year, start.month, 1)
-    while cur <= end:
-        if cur.month == 12:
-            nxt = date(cur.year + 1, 1, 1)
-        else:
-            nxt = date(cur.year, cur.month + 1, 1)
-        yield max(start, cur), min(end + timedelta(days=1), nxt)
-        cur = nxt
+def temperature_series(date_index: pd.DatetimeIndex) -> pd.DataFrame:
+    """A smooth seasonal curve + light noise, centred on Belgrade climate."""
+    rng = np.random.default_rng(seed=42)
+    doy = date_index.dayofyear.values
+    seasonal = 11 + 13 * np.cos(2 * np.pi * (doy - 200) / 365)
+    noise = rng.normal(0, 1.4, size=len(date_index))
+    temp = seasonal + noise
+    return pd.DataFrame({"date": date_index, "temperature_c": temp})
 
 
-def _fetch_point(
-    pd_key: str,
-    start: date,
-    end: date,
-    token: Optional[str] = None,
-    indicator: str = "Physical Flow",
-) -> pd.DataFrame:
-    headers = {"User-Agent": "serbia-gas-dashboard/1.0"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+def flow_series(date_index: pd.DatetimeIndex) -> pd.DataFrame:
+    """Per-point flows in mcm/day with realistic seasonal pattern."""
+    rng = np.random.default_rng(seed=7)
+    n = len(date_index)
+    doy = date_index.dayofyear.values
+    winter_factor = 0.5 + 0.5 * np.cos(2 * np.pi * (doy - 15) / 365)
 
-    rows: list[dict] = []
-    for win_start, win_end in _month_chunks(start, end):
-        params = {
-            "pointDirection": pd_key,
-            "from": win_start.isoformat(),
-            "to": win_end.isoformat(),
-            "indicator": indicator,
-            "periodType": "day",
-            "timezone": "CET",
-            "limit": -1,
+    kireevo = 6.0 + 2.5 * winter_factor + rng.normal(0, 0.25, n)
+    kkd_2 = 0.6 + 0.5 * winter_factor + rng.normal(0, 0.1, n)
+    kkd_hu = 4.5 + 4.0 * winter_factor + rng.normal(0, 0.3, n)
+    kalotina = 1.5 + 1.5 * winter_factor + rng.normal(0, 0.2, n)
+    # ~30% of HU flows are MET-contract
+    kkd_hu_met = np.clip(kkd_hu * 0.3 + rng.normal(0, 0.15, n), 0, None)
+
+    df = pd.DataFrame(
+        {
+            "date": date_index,
+            "kiskundorozsma_hu": np.clip(kkd_hu, 0, None),
+            "kireevo": np.clip(kireevo, 0, None),
+            "kiskundorozsma_2": np.clip(kkd_2, 0, None),
+            "kalotina": np.clip(kalotina, 0, None),
+            "kiskundorozsma_hu_met": kkd_hu_met,
         }
-        r = requests.get(f"{BASE}/operationaldata", params=params, headers=headers, timeout=60)
-        if r.status_code == 404:
-            continue
-        r.raise_for_status()
-        payload = r.json()
-        records = (
-            payload.get("operationaldatas")
-            or payload.get("operationaldata")
-            or payload.get("data")
-            or []
-        )
-        if isinstance(records, list):
-            rows.extend(records)
-        time.sleep(0.1)
+    )
+    return df
+
+
+def capacity_bookings() -> pd.DataFrame:
+    """Synthetic capacity bookings covering all TSO × point × period combinations."""
+    rng = np.random.default_rng(seed=11)
+    rows: list[dict] = []
+    today = pd.Timestamp(date.today()).normalize()
+    product_periods = {
+        "daily": [(today + pd.Timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(-2, 3)],
+        "monthly": [(today + pd.DateOffset(months=offset)).strftime("%b %Y") for offset in range(0, 5)],
+        "quarterly": [
+            f"Q{((today.month - 1) // 3 + offset) % 4 + 1} {today.year + ((today.month - 1) // 3 + offset) // 4}"
+            for offset in range(0, 5)
+        ],
+    }
+
+    offered_baseline = {
+        "FGSZ_exit": 105_000,
+        "Bulgartransgaz_exit": 95_000,
+        "Gastrans_entry_kireevo": 95_000,
+        "Gastrans_exit_kkd2": 70_000,
+        "FGSZ_entry_kkd2": 70_000,
+    }
+
+    def lookup(d):
+        key = d["tso"]
+        if "Kireevo" in d["border_point"]:
+            key += f"_{d['direction']}_kireevo"
+        elif "Kiskundorozsma 2" in d["border_point"]:
+            key += f"_{d['direction']}_kkd2"
+        else:
+            key += f"_{d['direction']}"
+        return offered_baseline.get(key, 80_000)
+
+    for d in CAPACITY_DEFS:
+        offered = lookup(d)
+        for product in ["daily", "monthly", "quarterly"]:
+            for period in product_periods[product]:
+                booked = offered * float(rng.uniform(0.45, 0.95))
+                if d["currency"] == "HUF":
+                    price = float(rng.uniform(0.0015, 0.0040))
+                else:
+                    price = float(rng.uniform(0.00002, 0.00012))
+                rows.append(
+                    {
+                        "tso": d["tso"],
+                        "border_point": d["border_point"],
+                        "direction": d["direction"],
+                        "product": product,
+                        "period": period,
+                        "offered_mwh": round(offered, 0),
+                        "booked_mwh": round(booked, 0),
+                        "utilisation_pct": round(booked / offered * 100, 1),
+                        "price": price,
+                        "currency": d["currency"],
+                        "price_unit": d["price_unit"],
+                        "pct_of_100": round(booked / offered * 100, 1),
+                    }
+                )
     return pd.DataFrame(rows)
-
-
-def _value_to_mcm_per_day(value: float, unit: str) -> float:
-    """Convert ENTSOG daily energy units to mcm/day using the app-wide GCV."""
-    unit_clean = str(unit).lower().replace(" ", "")
-    if "gwh" in unit_clean:
-        return value / CONVERSION_MCM_TO_GWH
-    if "mwh" in unit_clean:
-        return value / CONVERSION_MCM_TO_MWH
-    if "kwh" in unit_clean:
-        return value / CONVERSION_MCM_TO_KWH
-    return value / CONVERSION_MCM_TO_KWH
-
-
-def fetch_flows(start: date, end: date, token: Optional[str] = None) -> pd.DataFrame:
-    """Fetch canonical public ENTSOG physical flows and return mcm/day."""
-    frames: list[pd.DataFrame] = []
-    for canonical, pd_key in ENTSOG_POINT_DIRECTIONS.items():
-        raw = _fetch_point(pd_key, start, end, token=token)
-        if raw.empty:
-            continue
-
-        period_col = next(
-            (c for c in raw.columns if c.lower() in ("periodfrom", "from", "period")),
-            None,
-        )
-        value_col = next((c for c in raw.columns if c.lower() == "value"), None)
-        unit_col = next((c for c in raw.columns if c.lower() == "unit"), None)
-        if period_col is None or value_col is None:
-            continue
-
-        df = pd.DataFrame(
-            {
-                "date": (
-                    pd.to_datetime(raw[period_col], errors="coerce", utc=True)
-                    .dt.tz_convert("Europe/Belgrade")
-                    .dt.tz_localize(None)
-                    .dt.normalize()
-                ),
-                "value": pd.to_numeric(raw[value_col], errors="coerce"),
-                "unit": raw[unit_col].astype(str).str.lower() if unit_col else "kwh/d",
-            }
-        ).dropna()
-
-        df["mcm_per_day"] = [
-            _value_to_mcm_per_day(value, unit)
-            for value, unit in zip(df["value"], df["unit"])
-        ]
-        df = df.groupby("date", as_index=False)["mcm_per_day"].last()
-        df.rename(columns={"mcm_per_day": canonical}, inplace=True)
-        frames.append(df)
-
-    if not frames:
-        raise RuntimeError("ENTSOG returned no data for any Serbian point in the requested range.")
-
-    out = frames[0]
-    for nxt in frames[1:]:
-        out = out.merge(nxt, on="date", how="outer")
-    return out.sort_values("date").reset_index(drop=True)

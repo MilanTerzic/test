@@ -1,1105 +1,761 @@
 """
-ENTSOG cross-border capacity booking module.
+Serbia Gas Balance and Capacity Dashboard
+==========================================
 
-Primary responsibility: fetch yearly / quarterly / monthly / daily capacity
-publications (technical, offered, booked, available) from the ENTSOG
-Transparency Platform for the four Serbia cross-border points:
+Streamlit dashboard for Serbian natural gas flows, supply structure, demand
+forecast and cross-border capacity bookings.
 
-  1. Kiskundorozsma-2 (HU) / Horgos (RS)          HU<->RS
-  2. Kiskundorozsma   (HU)  > RS                  HU<->RS
-  3. Kalotina (BG) / Dimitrovgrad (RS)            BG<->RS
-  4. Kireevo / Kirevo (BG) / Zajecar (RS)         BG<->RS
+Tabs:
+  1. Gas Balance        — KPIs + 3 vertically-aligned compact charts
+  2. Flow Details       — per-point flow series and tables
+  3. Capacity Bookings  — Excel-style booking tables and capacity charts
+  4. Model & Assumptions
 
-ENTSOG endpoints used (all under https://transparency.entsog.eu/api/v1):
-
-  /operatorpointdirections   metadata: discover the live pointDirection IDs
-                             that match our four border points.
-  /operationaldata           the actual capacity timeseries; capacity is
-                             returned as one of the indicators below:
-                                - Firm Technical
-                                - Firm Booked
-                                - Firm Available
-
-The yearly / quarterly / monthly / daily split is requested through the
-`periodType` parameter (year / quarter / month / day). The endpoint returns
-one snapshot per period; we map those into our `auction_product_type`
-column directly.
-
-Units: ENTSOG returns kWh/day, kWh/h, MWh/day or GWh/day depending on the
-operator. We convert everything to mcm/day using the GCV configured in the
-app (default 10.55 kWh/m^3, matching the workbook).
-
-This module also keeps legacy helpers used by uploaded-CSV flow and by
-charts.py so the rest of the dashboard keeps working.
+Run locally:
+    pip install -r requirements.txt
+    streamlit run app.py
 """
 
 from __future__ import annotations
 
-import re
-import unicodedata
-from datetime import date, datetime, timezone
-from typing import Any, IO, Optional, Tuple, Union
+from datetime import date, timedelta
+from typing import Optional
 
-import numpy as np
 import pandas as pd
-import requests
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+
+import capacity, charts, demand, dummy, entsog, flows, model, temperature
+from config import (
+    BIH_SHARE,
+    CURVE_DISTORTION_DEFAULT,
+    CURVE_SHIFT_DEFAULT,
+    DOMESTIC_PRODUCTION_MCM,
+    LINEAR_COEFFS,
+    POINTS,
+    POLY_COEFFS,
+)
+
+# -----------------------------------------------------------------------------
+# Page setup — white, compact, operational
+# -----------------------------------------------------------------------------
+
+st.set_page_config(
+    page_title="Serbia Gas Balance & Capacity Dashboard",
+    page_icon="🇷🇸",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown(
+    """
+    <style>
+      .block-container { padding-top: 1.0rem; padding-bottom: 1.5rem; max-width: 1400px; }
+      div[data-testid="stMetricValue"] { font-size: 1.05rem; }
+      div[data-testid="stMetricLabel"] { font-size: 0.72rem; }
+      .stTabs [data-baseweb="tab"] { font-weight: 600; font-size: 0.95rem; }
+      h1 { font-size: 1.6rem !important; margin-bottom: 0.1rem; }
+      .stCaption { color: #555; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.title("🇷🇸 Serbia Gas Balance & Capacity Dashboard")
+st.caption(
+    "Daily supply composition · Belgrade temperature · Storage +/- · "
+    "Cross-border capacity bookings (FGSZ · Bulgartransgaz · Gastrans)"
+)
 
 
-# =============================================================================
-# Constants and ENTSOG metadata
-# =============================================================================
-
-ENTSOG_BASE_URL = "https://transparency.entsog.eu/api/v1"
-
-# Indicators we ask ENTSOG for via /operationaldata.
-ENTSOG_CAPACITY_INDICATORS = [
-    "Firm Technical",
-    "Firm Booked",
-    "Firm Available",
-]
-
-# Period types we request (one call per type per pointDirection).
-ENTSOG_PERIOD_TYPES = ["year", "quarter", "month", "day"]
-PERIOD_TYPE_TO_PRODUCT = {
-    "year": "yearly",
-    "quarter": "quarterly",
-    "month": "monthly",
-    "day": "daily",
-}
-
-# Energy conversion default (kWh per m^3, HHV).
-DEFAULT_GCV_KWH_PER_M3 = 10.55
-
-# Pattern set used to recognise our four target points in the ENTSOG metadata.
-TARGET_BORDER_POINTS = [
-    {
-        "canonical_key": "kiskundorozsma_2_horgos",
-        "label": "Kiskundorozsma-2 (HU) / Horgos (RS)",
-        "country_from": "HU",
-        "country_to": "RS",
-        "patterns_all": [],
-        "patterns_any": ["kiskundorozsma 2", "kiskundorozsma ii", "horgos", "horgo"],
-        "patterns_not": [],
-    },
-    {
-        "canonical_key": "kiskundorozsma_hu_rs",
-        "label": "Kiskundorozsma (HU > RS)",
-        "country_from": "HU",
-        "country_to": "RS",
-        "patterns_all": ["kiskundorozsma"],
-        "patterns_any": [],
-        "patterns_not": ["kiskundorozsma 2", "kiskundorozsma ii", "horgos"],
-    },
-    {
-        "canonical_key": "kalotina_dimitrovgrad",
-        "label": "Kalotina (BG) / Dimitrovgrad (RS)",
-        "country_from": "BG",
-        "country_to": "RS",
-        "patterns_all": [],
-        "patterns_any": ["kalotina", "dimitrovgrad"],
-        "patterns_not": [],
-    },
-    {
-        "canonical_key": "kireevo_zajecar",
-        "label": "Kireevo/Kirevo (BG) / Zajecar (RS)",
-        "country_from": "BG",
-        "country_to": "RS",
-        "patterns_all": [],
-        "patterns_any": ["kireevo", "kirevo", "zajecar", "zaychar"],
-        "patterns_not": [],
-    },
-]
-
-BORDER_POINT_SHORT_NAMES = {
-    "Kireevo (BG)/Zaychar (RS)": "BG->RS Kireevo",
-    "Kireevo / Zaychar": "BG->RS Kireevo",
-    "Kiskundorozsma 2": "RS->HU Kisk. 2",
-    "Kiskundorozsma (HU)/Kiskundorozsma (RS)": "HU->RS Kisk.",
-    "Kiskundorozsma": "HU->RS Kisk.",
-    "Kalotina": "BG->RS Kalotina",
-    "Horgos": "HU->RS Horgos",
-    "Zvornik": "BA/RS Zvornik",
-    "Mokrin": "RS storage / Mokrin",
-}
-
-PRODUCT_ORDER = ["yearly", "quarterly", "monthly", "daily", "Unknown"]
+@st.cache_data(ttl=60 * 60 * 6)
+def load_capacity_fx_rates():
+    return capacity.fetch_latest_fx_rates()
 
 
-# =============================================================================
-# Small utilities
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Sidebar
+# -----------------------------------------------------------------------------
 
-def _strip_accents(text: Any) -> str:
-    """ASCII-fold and lowercase, for fuzzy matching of ENTSOG point labels."""
-    if text is None:
-        return ""
-    s = str(text)
-    # NFKD decomposition then drop combining characters.
-    nfkd = unicodedata.normalize("NFKD", s)
-    ascii_only = "".join(ch for ch in nfkd if not unicodedata.combining(ch))
-    return ascii_only.lower()
+with st.sidebar:
+    st.header("⚙️ Configuration")
 
+    today = date.today()
+    # Default: ~10 historical days + today + ~10 forecast days
+    default_start = today - timedelta(days=10)
+    default_end = today + timedelta(days=10)
 
-def _to_number(value: Any) -> float:
-    if value is None:
-        return np.nan
-    if isinstance(value, float) and np.isnan(value):
-        return np.nan
-    if isinstance(value, (int, float)):
-        return float(value)
-    text = str(value).strip().replace("\u00a0", " ")
-    if not text or text.lower() in ("nan", "none", "-", "n/a", "na"):
-        return np.nan
-    text = text.replace("%", "")
-    if "," in text and "." in text:
-        text = text.replace(",", "")
-    elif "," in text and text.count(",") == 1 and len(text.split(",")[-1]) <= 3:
-        text = text.replace(",", ".")
-    match = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", text)
-    if not match:
-        return np.nan
-    try:
-        return float(match.group(0))
-    except ValueError:
-        return np.nan
-
-
-# =============================================================================
-# ENTSOG HTTP layer
-# =============================================================================
-
-def _entsog_get_json(
-    path: str,
-    params: dict[str, Any],
-    timeout: int = 60,
-    session: Optional[requests.Session] = None,
-) -> Tuple[list[dict[str, Any]], str, Optional[str]]:
-    """GET an ENTSOG endpoint. Never raises; returns ([], url, error) on failure."""
-    url = f"{ENTSOG_BASE_URL}/{path.lstrip('/')}"
-    sess = session or requests
-    try:
-        response = sess.get(
-            url,
-            params=params,
-            timeout=timeout,
-            headers={
-                "User-Agent": "serbia-gas-dashboard/1.0 (capacity-module)",
-                "Accept": "application/json",
-            },
-        )
-    except requests.RequestException as exc:
-        return [], url, f"network error: {exc}"
-
-    if response.status_code >= 400:
-        return [], response.url, f"HTTP {response.status_code} {response.reason}"
-
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        return [], response.url, f"invalid JSON: {exc}"
-
-    records: Any = None
-    for key in (
-        "operationaldatas",
-        "operationaldata",
-        "operatorpointdirections",
-        "data",
-        path.strip("/").lower(),
-    ):
-        if isinstance(payload, dict) and key in payload:
-            records = payload[key]
-            break
-    if records is None:
-        records = payload if isinstance(payload, list) else []
-    if not isinstance(records, list):
-        records = []
-    return records, response.url, None
-
-
-# =============================================================================
-# Border-point matching against ENTSOG metadata
-# =============================================================================
-
-def _match_target_border_point(
-    point_label: Any, country_from: str, country_to: str
-) -> Optional[dict]:
-    """Return the canonical spec for an ENTSOG point label or None."""
-    label_norm = _strip_accents(point_label)
-    if not label_norm:
-        return None
-    cf = (country_from or "").upper()
-    ct = (country_to or "").upper()
-    for spec in TARGET_BORDER_POINTS:
-        pair_ok = (
-            (cf == spec["country_from"] and ct == spec["country_to"])
-            or (cf == spec["country_to"] and ct == spec["country_from"])
-        )
-        if not pair_ok:
-            continue
-        if spec["patterns_all"] and not all(p in label_norm for p in spec["patterns_all"]):
-            continue
-        if spec["patterns_any"] and not any(p in label_norm for p in spec["patterns_any"]):
-            continue
-        if spec["patterns_not"] and any(p in label_norm for p in spec["patterns_not"]):
-            continue
-        return spec
-    return None
-
-
-def _discover_target_point_directions(
-    session: Optional[requests.Session] = None,
-) -> Tuple[pd.DataFrame, list[str], Optional[str]]:
-    """Query /operatorpointdirections and keep rows matching our 4 target IPs."""
-    records, url, err = _entsog_get_json(
-        "operatorpointdirections", {"limit": -1}, session=session,
+    date_range = st.date_input(
+        "Date range",
+        value=(default_start, default_end),
+        help="Rolling window centred on today. Keep it short for a readable chart.",
     )
-    urls = [url]
-    if err or not records:
-        return pd.DataFrame(), urls, err or "operatorpointdirections returned no rows"
-
-    df = pd.DataFrame(records)
-    expected = [
-        "pointKey", "pointLabel", "operatorKey", "tsoEicCode", "operatorLabel",
-        "directionKey", "validFrom", "validTo", "hasData",
-        "tSOCountry", "adjacentCountry", "adjacentTsoEic",
-    ]
-    for col in expected:
-        if col not in df.columns:
-            df[col] = ""
-
-    df["pointLabel"] = df["pointLabel"].astype(str)
-    df["country_from"] = df["tSOCountry"].astype(str).str.upper().str.strip()
-    df["country_to"] = df["adjacentCountry"].astype(str).str.upper().str.strip()
-    df["directionKey"] = df["directionKey"].astype(str).str.lower().str.strip()
-
-    matched: list[dict] = []
-    for _, row in df.iterrows():
-        spec = _match_target_border_point(
-            row["pointLabel"], row["country_from"], row["country_to"]
-        )
-        if not spec:
-            continue
-        op_key = str(row.get("operatorKey", "")).strip()
-        pt_key = str(row.get("pointKey", "")).strip()
-        d_key = str(row.get("directionKey", "")).strip()
-        composite = f"{op_key}{pt_key}{d_key}" if op_key and pt_key and d_key else ""
-        matched.append({
-            "canonical_key": spec["canonical_key"],
-            "canonical_label": spec["label"],
-            "spec_country_from": spec["country_from"],
-            "spec_country_to": spec["country_to"],
-            "pointKey": pt_key,
-            "pointLabel": row.get("pointLabel", ""),
-            "operatorKey": op_key,
-            "operatorLabel": row.get("operatorLabel", ""),
-            "tsoEicCode": row.get("tsoEicCode", ""),
-            "directionKey": d_key,
-            "pointDirection": composite,
-            "validFrom": row.get("validFrom", ""),
-            "validTo": row.get("validTo", ""),
-            "hasData": row.get("hasData", ""),
-            "country_from": row["country_from"],
-            "country_to": row["country_to"],
-        })
-    if not matched:
-        return pd.DataFrame(), urls, (
-            "No /operatorpointdirections row matched any of the 4 target border points. "
-            "ENTSOG may have renamed a point; check the live operatorpointdirections "
-            "endpoint for HU<->RS and BG<->RS rows."
-        )
-    return pd.DataFrame(matched), urls, None
-
-
-# =============================================================================
-# Unit conversion
-# =============================================================================
-
-def _convert_to_mcm_per_day(
-    value: float, unit: Any, gcv_kwh_per_m3: float
-) -> Tuple[float, str]:
-    if pd.isna(value):
-        return np.nan, "missing_value"
-    if not gcv_kwh_per_m3 or gcv_kwh_per_m3 <= 0:
-        return np.nan, "invalid_gcv"
-    u = str(unit or "").lower().replace(" ", "").replace("_", "/")
-    kwh_per_mcm = gcv_kwh_per_m3 * 1_000_000.0
-
-    if u in ("kwh/d", "kwh/day", "kwh"):
-        kwh_day = value
-    elif u in ("mwh/d", "mwh/day", "mwh"):
-        kwh_day = value * 1_000.0
-    elif u in ("gwh/d", "gwh/day", "gwh"):
-        kwh_day = value * 1_000_000.0
-    elif u in ("kwh/h", "kwh/hour"):
-        kwh_day = value * 24.0
-    elif u in ("mwh/h", "mwh/hour"):
-        kwh_day = value * 24_000.0
-    elif u in ("m3/d", "m3/day", "scm/d", "scm/day"):
-        return value / 1_000_000.0, "ok"
-    elif u in ("mcm/d", "mcm/day"):
-        return float(value), "ok"
+    if isinstance(date_range, tuple) and len(date_range) == 2:
+        start_date, end_date = date_range
     else:
-        return np.nan, f"unsupported_unit:{unit or 'unknown'}"
-    return kwh_day / kwh_per_mcm, "ok"
+        start_date, end_date = default_start, default_end
+
+    st.divider()
+    st.subheader("Data sources")
+
+    use_dummy = st.toggle(
+        "Use dummy demonstration data",
+        value=False,
+        help="ON → realistic synthetic data. OFF → fetch public ENTSOG/Open-Meteo data.",
+    )
+    show_debug_checks = st.checkbox("Show debug data checks", value=False)
+    entsog_token = st.text_input(
+        "ENTSOG API token (optional)", type="password",
+        help="Public ENTSOG endpoints don't require a token.",
+    )
+    temp_source = st.selectbox(
+        "Temperature source",
+        options=["Open-Meteo (auto)", "weather.com scrape", "Manual / Upload"],
+        index=0,
+    )
+
+    st.divider()
+    st.subheader("Manual fallbacks")
+    flow_upload = st.file_uploader("Flow data (CSV/XLSX)", type=["csv", "xlsx"])
+    capacity_upload = st.file_uploader("Capacity bookings (CSV/XLSX)", type=["csv", "xlsx"])
+    temp_upload = st.file_uploader("Temperature data (CSV/XLSX)", type=["csv", "xlsx"])
+    model_upload = st.file_uploader("Regression model workbook (XLSX)", type=["xlsx"])
+
+    st.divider()
+    st.subheader("Model overrides")
+    use_polynomial = st.toggle("Use polynomial regression", value=True)
+    curve_shift = st.number_input("Curve shift (mcm/d)", value=CURVE_SHIFT_DEFAULT, step=0.1)
+    curve_distortion = st.number_input(
+        "Curve distortion factor", value=CURVE_DISTORTION_DEFAULT, step=0.1,
+        help="1.0 = no distortion (default). Workbook uses 2.8 only in extreme cold scenarios.",
+    )
+    bih_pct_percent = st.slider(
+        "Bosnia consumption / export (% of Import from BG)",
+        min_value=0.0, max_value=20.0, value=BIH_SHARE * 100, step=0.5,
+        key="bosnia_consumption_percent",
+    )
+    bih_pct = bih_pct_percent / 100.0
+    production_mcm = st.number_input(
+        "Domestic production (mcm/day)", value=DOMESTIC_PRODUCTION_MCM, step=0.1,
+    )
 
 
-# =============================================================================
-# Period classification fallback
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Build the master date index and load all series
+# -----------------------------------------------------------------------------
 
-def _classify_product_from_period(date_from: Any, date_to: Any) -> str:
-    if pd.isna(date_from) or pd.isna(date_to):
-        return "daily"
+if start_date > end_date:
+    st.error("Start date must be before end date.")
+    st.stop()
+
+# Single master date_index that every series is reindexed to
+date_index = pd.date_range(start=start_date, end=end_date, freq="D")
+today_ts = pd.Timestamp(today)
+
+# 1) Coefficients
+poly_coeffs = POLY_COEFFS
+linear_coeffs = LINEAR_COEFFS
+if model_upload is not None:
     try:
-        df_ts = pd.to_datetime(date_from)
-        dt_ts = pd.to_datetime(date_to)
-    except (TypeError, ValueError):
-        return "daily"
-    days = max(1, int((dt_ts - df_ts).total_seconds() // 86400) + 1)
-    if days >= 330:
-        return "yearly"
-    if days >= 80:
-        return "quarterly"
-    if days >= 27:
-        return "monthly"
-    return "daily"
+        poly_coeffs, linear_coeffs = model.read_coefficients_from_xlsx(model_upload)
+        st.sidebar.success("Coefficients loaded from uploaded workbook.")
+    except Exception as exc:  # noqa: BLE001
+        st.sidebar.warning(f"Could not read coefficients from workbook: {exc}")
 
+# 2) Temperature
+temp_df: Optional[pd.DataFrame] = None
+if temp_upload is not None:
+    try:
+        temp_df = temperature.read_uploaded(temp_upload)
+    except Exception as exc:  # noqa: BLE001
+        st.sidebar.warning(f"Could not parse uploaded temperature file: {exc}")
 
-def _indicator_to_column(indicator: Any) -> str:
-    i = str(indicator or "").lower()
-    if "technical" in i:
-        return "technical_capacity"
-    if "offered" in i:
-        return "offered_capacity"
-    if "booked" in i or "allocated" in i or "allocation" in i:
-        return "booked_capacity"
-    if "available" in i:
-        return "available_capacity"
-    return ""
-
-
-# =============================================================================
-# MAIN PUBLIC FUNCTION
-# =============================================================================
-
-def fetch_entsog_cross_border_capacity_year(
-    year: int,
-    include_points: Optional[list[str]] = None,
-    direction_filter: Optional[list[str]] = None,
-    preferred_unit: str = "mcm/day",
-    gcv_kwh_per_m3: float = DEFAULT_GCV_KWH_PER_M3,
-    session: Optional[requests.Session] = None,
-) -> Tuple[pd.DataFrame, dict[str, Any]]:
-    """Fetch yearly/quarterly/monthly/daily capacity bookings for the 4 IPs."""
-    start_date = date(int(year), 1, 1)
-    end_date = date(int(year), 12, 31)
-    quality: dict[str, Any] = {
-        "last_successful_fetch": None,
-        "records_fetched": 0,
-        "api_errors": [],
-        "query_urls": [],
-        "missing_points": [],
-        "missing_products": [],
-        "data_warnings": [],
-        "matched_point_directions": [],
-        "date_range": f"{start_date.isoformat()} to {end_date.isoformat()}",
-        "unit": preferred_unit,
-        "gcv_kwh_per_m3": gcv_kwh_per_m3,
-    }
-
-    # --- 1. Discover live pointDirection IDs --------------------------------
-    opd_df, opd_urls, opd_err = _discover_target_point_directions(session=session)
-    quality["query_urls"].extend(opd_urls)
-    if opd_err:
-        quality["api_errors"].append(opd_err)
-    if opd_df.empty:
-        quality["missing_points"] = [s["label"] for s in TARGET_BORDER_POINTS]
-        return _empty_year_frame(), quality
-
-    if include_points:
-        opd_df = opd_df[opd_df["canonical_key"].isin(include_points)].copy()
-    if direction_filter:
-        df_lc = {d.lower() for d in direction_filter}
-        opd_df = opd_df[opd_df["directionKey"].isin(df_lc)].copy()
-    if opd_df.empty:
-        quality["api_errors"].append("Filters left no operator-point-direction rows to query.")
-        return _empty_year_frame(), quality
-
-    expected_canonicals = set(opd_df["canonical_key"].unique())
-    expected_products = set(PERIOD_TYPE_TO_PRODUCT.values())
-
-    quality["matched_point_directions"] = sorted(
-        opd_df.apply(
-            lambda r: f"{r['canonical_label']} | {r['operatorLabel']} | {r['directionKey']}",
-            axis=1,
-        ).tolist()
-    )
-
-    # --- 2. Fetch operationaldata -------------------------------------------
-    sess = session or requests.Session()
-    sess.headers.update({
-        "User-Agent": "serbia-gas-dashboard/1.0 (capacity-module)",
-        "Accept": "application/json",
-    })
-
-    chunks_by_period: dict[str, list[Tuple[date, date]]] = {
-        # Yearly and quarterly products only have a handful of records per
-        # year, so fetch the full year in a single call to avoid the same
-        # record being returned twice from overlapping half-year chunks.
-        "year": [(start_date, end_date)],
-        "quarter": [(start_date, end_date)],
-        # Monthly = 12 rows, also small; one call is enough.
-        "month": [(start_date, end_date)],
-        # Daily = up to 366 rows but the ENTSOG server has handled this in
-        # one call historically; if it ever times out, switch to halves.
-        "day": _split_year_into_chunks(start_date, end_date),
-    }
-    all_records: list[dict] = []
-
-    for _, opd_row in opd_df.iterrows():
-        pd_composite = opd_row.get("pointDirection", "")
-        op_key = opd_row.get("operatorKey", "")
-        pt_key = opd_row.get("pointKey", "")
-        d_key = opd_row.get("directionKey", "")
-        canonical_key = opd_row["canonical_key"]
-        canonical_label = opd_row["canonical_label"]
-
-        for period_type in ENTSOG_PERIOD_TYPES:
-            product_label = PERIOD_TYPE_TO_PRODUCT[period_type]
-            for chunk_start, chunk_end in chunks_by_period[period_type]:
-                params: dict[str, Any] = {
-                    "from": chunk_start.isoformat(),
-                    "to": chunk_end.isoformat(),
-                    "indicator": ",".join(ENTSOG_CAPACITY_INDICATORS),
-                    "periodType": period_type,
-                    "timezone": "CET",
-                    "limit": -1,
-                }
-                if pd_composite:
-                    params["pointDirection"] = pd_composite
-                else:
-                    params["operatorKey"] = op_key
-                    params["pointKey"] = pt_key
-                    params["directionKey"] = d_key
-
-                records, url, err = _entsog_get_json(
-                    "operationaldata", params, timeout=60, session=sess,
-                )
-                quality["query_urls"].append(url)
-                if err:
-                    quality["api_errors"].append(
-                        f"{canonical_label} | {product_label} | "
-                        f"{chunk_start}..{chunk_end}: {err}"
-                    )
-                    continue
-                if not records:
-                    continue
-
-                for rec in records:
-                    rec["_canonical_key"] = canonical_key
-                    rec["_canonical_label"] = canonical_label
-                    rec["_country_from"] = opd_row.get("spec_country_from", "")
-                    rec["_country_to"] = opd_row.get("spec_country_to", "")
-                    rec["_query_period_type"] = period_type
-                    rec["_query_product_label"] = product_label
-                    rec["_query_url"] = url
-                all_records.extend(records)
-
-    if not all_records:
-        quality["missing_points"] = sorted(expected_canonicals)
-        quality["missing_products"] = sorted(expected_products)
-        quality["api_errors"].append(
-            "All /operationaldata queries returned zero records. Check API errors "
-            "above, or that ENTSOG has published capacity data for the requested "
-            "year. Try a different year."
-        )
-        return _empty_year_frame(), quality
-
-    quality["records_fetched"] = len(all_records)
-    quality["last_successful_fetch"] = (
-        datetime.now(timezone.utc).isoformat(timespec="seconds")
-    )
-
-    # --- 3. Normalize & pivot ------------------------------------------------
-    raw = pd.DataFrame(all_records)
-    raw = _normalize_raw_capacity(
-        raw, gcv_kwh_per_m3=gcv_kwh_per_m3, preferred_unit=preferred_unit
-    )
-    df = _pivot_indicators_to_columns(raw, preferred_unit=preferred_unit)
-
-    if df.empty:
-        quality["api_errors"].append(
-            "Records fetched but none mapped to Firm Technical / Firm Booked / "
-            "Firm Available indicators."
-        )
-        return _empty_year_frame(), quality
-
-    # --- 4. Derived columns + warnings --------------------------------------
-    tech = pd.to_numeric(df.get("technical_capacity"), errors="coerce")
-    bkd = pd.to_numeric(df.get("booked_capacity"), errors="coerce")
-    df["booked_pct_of_technical"] = np.where(
-        (tech > 0) & bkd.notna(), bkd / tech * 100.0, np.nan,
-    )
-
-    if "available_capacity" not in df.columns:
-        df["available_capacity"] = np.nan
-    avail_missing = df["available_capacity"].isna() & tech.notna() & bkd.notna()
-    df.loc[avail_missing, "available_capacity"] = tech - bkd
-
-    if "offered_capacity" not in df.columns:
-        df["offered_capacity"] = np.nan
-
-    df["country_pair"] = (
-        df["country_from"].astype(str) + ">" + df["country_to"].astype(str)
-    )
-    df["warning"] = ""
-    no_off = df["offered_capacity"].isna()
-    df.loc[no_off, "warning"] = (
-        df.loc[no_off, "warning"].astype(str)
-        + "offered_capacity not available from ENTSOG; "
-    )
-    tech_zero = (tech == 0) & bkd.notna() & (bkd > 0)
-    df.loc[tech_zero, "warning"] = (
-        df.loc[tech_zero, "warning"].astype(str)
-        + "technical_capacity=0 suspicious; "
-    )
-    over = (bkd > tech) & tech.notna() & bkd.notna()
-    df.loc[over, "warning"] = (
-        df.loc[over, "warning"].astype(str)
-        + "booked > technical (re-auctioned?); "
-    )
-
-    # DQ aggregation
-    present_canonicals = set(df["_canonical_key"].dropna().unique())
-    quality["missing_points"] = sorted([
-        spec["label"] for spec in TARGET_BORDER_POINTS
-        if spec["canonical_key"] in expected_canonicals
-        and spec["canonical_key"] not in present_canonicals
-    ])
-    present_products_by_point = (
-        df.groupby("_canonical_key")["auction_product_type"]
-        .agg(lambda s: set(s.dropna().unique()))
-        .to_dict()
-    )
-    missing_prod_lines: list[str] = []
-    for ck in present_canonicals:
-        present = present_products_by_point.get(ck, set())
-        missing = sorted(expected_products - present)
-        if missing:
-            label = next(
-                (s["label"] for s in TARGET_BORDER_POINTS if s["canonical_key"] == ck),
-                ck,
-            )
-            missing_prod_lines.append(f"{label}: {', '.join(missing)}")
-    quality["missing_products"] = missing_prod_lines
-
-    dup_mask = df.duplicated(
-        subset=["_canonical_key", "direction", "auction_product_type", "date_from", "date_to"],
-        keep=False,
-    )
-    if dup_mask.any():
-        df.loc[dup_mask, "warning"] = df.loc[dup_mask, "warning"] + "duplicate record; "
-        quality["data_warnings"].append(
-            f"{int(dup_mask.sum())} duplicate (point, product, period) rows found."
-        )
-
-    flagged = int(df["warning"].astype(str).str.len().gt(0).sum())
-    if flagged:
-        quality["data_warnings"].append(
-            f"{flagged} rows carry a warning flag (see 'warning' column)."
-        )
-
-    sort_cols = [c for c in ["_canonical_label", "direction", "auction_product_type", "date_from"] if c in df.columns]
-    df = df.sort_values(sort_cols).reset_index(drop=True)
-    return df, quality
-
-
-def _split_year_into_chunks(start: date, end: date) -> list[Tuple[date, date]]:
-    mid = date(start.year, 7, 1)
-    if start >= mid or end <= mid:
-        return [(start, end)]
-    return [(start, date(start.year, 6, 30)), (mid, end)]
-
-
-def _empty_year_frame() -> pd.DataFrame:
-    cols = [
-        "date_from", "date_to", "gas_day",
-        "country_from", "country_to", "country_pair",
-        "TSO", "TSO_code",
-        "interconnection_point_name", "interconnection_point_code",
-        "direction", "auction_product_type",
-        "technical_capacity", "offered_capacity", "booked_capacity", "available_capacity",
-        "booked_pct_of_technical",
-        "unit", "source_url", "query_metadata", "warning",
-        "_canonical_key", "_canonical_label",
-    ]
-    return pd.DataFrame(columns=cols)
-
-
-# =============================================================================
-# Normalization / pivoting
-# =============================================================================
-
-def _normalize_raw_capacity(
-    raw: pd.DataFrame, gcv_kwh_per_m3: float, preferred_unit: str,
-) -> pd.DataFrame:
-    """Heterogeneous ENTSOG records -> tidy long frame."""
-
-    def first_col(*candidates):
-        for c in candidates:
-            if c in raw.columns:
-                return c
-        return None
-
-    period_from_col = first_col("periodFrom", "from", "PeriodFrom")
-    period_to_col = first_col("periodTo", "to", "PeriodTo")
-    indicator_col = first_col("indicator", "Indicator")
-    unit_col = first_col("unit", "Unit")
-    value_col = first_col("value", "Value")
-    op_label_col = first_col("operatorLabel", "OperatorLabel")
-    eic_col = first_col("tsoEicCode", "TsoEicCode")
-    point_label_col = first_col("pointLabel", "PointLabel")
-    point_key_col = first_col("pointKey", "PointKey")
-    direction_col = first_col("directionKey", "DirectionKey", "direction")
-    period_type_col = first_col("periodType", "PeriodType")
-
-    df = pd.DataFrame(index=raw.index)
-    if period_from_col:
-        df["date_from"] = pd.to_datetime(raw[period_from_col], errors="coerce", utc=True)
-        if df["date_from"].notna().any():
-            df["date_from"] = df["date_from"].dt.tz_convert("Europe/Belgrade").dt.tz_localize(None)
-    else:
-        df["date_from"] = pd.NaT
-    if period_to_col:
-        df["date_to"] = pd.to_datetime(raw[period_to_col], errors="coerce", utc=True)
-        if df["date_to"].notna().any():
-            df["date_to"] = df["date_to"].dt.tz_convert("Europe/Belgrade").dt.tz_localize(None)
-    else:
-        df["date_to"] = pd.NaT
-    df["gas_day"] = df["date_from"].dt.normalize()
-
-    df["indicator"] = raw[indicator_col].astype(str) if indicator_col else ""
-    df["unit_native"] = raw[unit_col].astype(str) if unit_col else ""
-    df["value_native"] = raw[value_col].map(_to_number) if value_col else np.nan
-
-    converted, status = [], []
-    for v, u in zip(df["value_native"], df["unit_native"]):
-        c, s = _convert_to_mcm_per_day(v, u, gcv_kwh_per_m3=gcv_kwh_per_m3)
-        converted.append(c)
-        status.append(s)
-    df["value_mcm_day"] = converted
-    df["conversion_status"] = status
-
-    if preferred_unit == "mcm/day":
-        df["value_final"] = df["value_mcm_day"]
-        df["unit_final"] = "mcm/day"
-    else:
-        df["value_final"] = df["value_native"]
-        df["unit_final"] = df["unit_native"].where(df["unit_native"].astype(bool), "n/a")
-
-    df["TSO"] = raw[op_label_col].astype(str) if op_label_col else ""
-    df["TSO_code"] = raw[eic_col].astype(str) if eic_col else ""
-    df["interconnection_point_name"] = raw[point_label_col].astype(str) if point_label_col else ""
-    df["interconnection_point_code"] = raw[point_key_col].astype(str) if point_key_col else ""
-    df["direction"] = raw[direction_col].astype(str).str.lower() if direction_col else ""
-
-    query_pt = (
-        raw["_query_period_type"].astype(str).str.lower()
-        if "_query_period_type" in raw.columns
-        else pd.Series([""] * len(raw), index=raw.index)
-    )
-    actual_pt = (
-        raw[period_type_col].astype(str).str.lower()
-        if period_type_col
-        else pd.Series([""] * len(raw), index=raw.index)
-    )
-    chosen_pt = query_pt.where(query_pt.isin(ENTSOG_PERIOD_TYPES), actual_pt)
-    mapped = chosen_pt.map(PERIOD_TYPE_TO_PRODUCT).fillna("")
-    fallback = [
-        _classify_product_from_period(a, b)
-        for a, b in zip(df["date_from"], df["date_to"])
-    ]
-    df["auction_product_type"] = [m if m else f for m, f in zip(mapped, fallback)]
-
-    df["_canonical_key"] = (
-        raw["_canonical_key"] if "_canonical_key" in raw.columns else ""
-    )
-    df["_canonical_label"] = (
-        raw["_canonical_label"] if "_canonical_label" in raw.columns else ""
-    )
-    df["country_from"] = (
-        raw["_country_from"] if "_country_from" in raw.columns else ""
-    )
-    df["country_to"] = raw["_country_to"] if "_country_to" in raw.columns else ""
-    df["source_url"] = raw["_query_url"] if "_query_url" in raw.columns else ""
-    df["query_metadata"] = (
-        "periodType=" + chosen_pt.fillna("").astype(str)
-        + "; indicator=" + df["indicator"].astype(str)
-    )
-
-    df["metric_col"] = df["indicator"].map(_indicator_to_column)
-    df = df[df["metric_col"] != ""].copy()
-    return df
-
-
-def _pivot_indicators_to_columns(df: pd.DataFrame, preferred_unit: str) -> pd.DataFrame:
-    if df.empty:
-        return _empty_year_frame()
-
-    # Keys that uniquely identify a (point, product, period) row. Note that
-    # source_url and query_metadata are deliberately NOT in the key because
-    # they vary per HTTP call (one per indicator) — keeping them would prevent
-    # the indicators from collapsing into a single row.
-    key_cols = [
-        "date_from", "date_to", "gas_day",
-        "country_from", "country_to",
-        "TSO", "TSO_code",
-        "interconnection_point_name", "interconnection_point_code",
-        "direction", "auction_product_type",
-        "unit_final",
-        "_canonical_key", "_canonical_label",
-    ]
-    # Drop rows with NaT date_from/date_to to keep pivot keys hashable.
-    work = df.dropna(subset=["date_from", "date_to"]).copy()
-    if work.empty:
-        return _empty_year_frame()
-
-    # Pivot the numeric value across indicators.
-    pivot = (
-        work.pivot_table(
-            index=key_cols,
-            columns="metric_col",
-            values="value_final",
-            aggfunc="mean",
-        )
-        .reset_index()
-    )
-    for c in ("technical_capacity", "offered_capacity", "booked_capacity", "available_capacity"):
-        if c not in pivot.columns:
-            pivot[c] = np.nan
-
-    # Aggregate source_url and query_metadata separately (first non-empty).
-    meta = (
-        work.groupby(key_cols, dropna=False)
-        .agg(
-            source_url=("source_url", lambda s: next((str(x) for x in s if str(x).strip()), "")),
-            query_metadata=("query_metadata", lambda s: " | ".join(sorted({str(x) for x in s if str(x).strip()}))),
-        )
-        .reset_index()
-    )
-    pivot = pivot.merge(meta, on=key_cols, how="left")
-
-    pivot = pivot.rename(columns={"unit_final": "unit"})
-
-    ordered = [
-        "date_from", "date_to", "gas_day",
-        "country_from", "country_to",
-        "TSO", "TSO_code",
-        "interconnection_point_name", "interconnection_point_code",
-        "direction", "auction_product_type",
-        "technical_capacity", "offered_capacity", "booked_capacity", "available_capacity",
-        "unit", "source_url", "query_metadata",
-        "_canonical_key", "_canonical_label",
-    ]
-    for c in ordered:
-        if c not in pivot.columns:
-            pivot[c] = "" if c in ("source_url", "query_metadata", "unit") else np.nan
-    return pivot[ordered].copy()
-
-
-# =============================================================================
-# FX rates (used by legacy capacity-bookings upload flow)
-# =============================================================================
-
-def fetch_latest_fx_rates(base: str = "EUR") -> dict[str, Any]:
-    sources = [
-        ("frankfurter.dev", f"https://api.frankfurter.dev/v1/latest?base={base}"),
-        ("frankfurter.app", f"https://api.frankfurter.app/latest?base={base}"),
-    ]
-    for src, url in sources:
+if temp_df is None and not use_dummy:
+    if temp_source == "Open-Meteo (auto)":
         try:
-            r = requests.get(url, timeout=10)
-            if r.status_code == 200:
-                payload = r.json()
-                rates = payload.get("rates") or payload.get("Rates") or {}
-                if rates:
-                    rates[base] = 1.0
-                    return {
-                        "base": base,
-                        "rates": {k: float(v) for k, v in rates.items()},
-                        "date": payload.get("date", ""),
-                        "source": src,
-                    }
-        except (requests.RequestException, ValueError):
-            continue
-    return {
-        "base": base,
-        "rates": {base: 1.0, "BGN": 1.95583},  # fixed BGN parity
-        "date": "",
-        "source": "fallback_static",
-    }
+            temp_df = temperature.fetch_open_meteo(start_date, end_date)
+        except Exception as exc:  # noqa: BLE001
+            st.warning(f"Open-Meteo fetch failed — falling back to dummy: {exc}")
+    elif temp_source == "weather.com scrape":
+        try:
+            temp_df = temperature.fetch_weather_com(start_date, end_date)
+        except Exception as exc:  # noqa: BLE001
+            st.warning(f"weather.com scrape failed — falling back to dummy: {exc}")
+
+if temp_df is None:
+    temp_df = dummy.temperature_series(date_index)
+
+temp_df = temperature.align(temp_df, date_index)
+
+# 3) Flows
+flow_df: Optional[pd.DataFrame] = None
+if flow_upload is not None:
+    try:
+        flow_df = flows.read_uploaded(flow_upload)
+    except Exception as exc:  # noqa: BLE001
+        st.sidebar.warning(f"Could not parse uploaded flow file: {exc}")
+
+if flow_df is None and not use_dummy:
+    try:
+        flow_df = entsog.fetch_flows(start_date, end_date, token=entsog_token or None)
+    except Exception as exc:  # noqa: BLE001
+        st.warning(f"ENTSOG fetch failed — falling back to dummy: {exc}")
+
+if flow_df is None:
+    flow_df = dummy.flow_series(date_index)
+
+flow_df = flows.align(flow_df, date_index)
+
+# 4) Capacity
+cap_df: Optional[pd.DataFrame] = None
+if capacity_upload is not None:
+    try:
+        cap_df = capacity.read_uploaded(capacity_upload)
+    except Exception as exc:  # noqa: BLE001
+        st.sidebar.warning(f"Could not parse uploaded capacity file: {exc}")
+if cap_df is None and use_dummy:
+    cap_df = dummy.capacity_bookings()
+elif cap_df is None:
+    cap_df = capacity.empty_capacity_frame()
+capacity_fx = load_capacity_fx_rates()
+cap_df = capacity.prepare_chart_data(cap_df, fx_rates=capacity_fx)
+cap_quality = capacity.run_data_quality_checks(cap_df)
+cap_df = capacity.attach_quality_warnings(cap_df, cap_quality)
+
+# 5) Build balance — single source of truth, all on date_index
+balance = demand.build_balance(
+    date_index=date_index,
+    today_ts=today_ts,
+    flow_df=flow_df,
+    temp_df=temp_df,
+    poly_coeffs=poly_coeffs,
+    linear_coeffs=linear_coeffs,
+    use_polynomial=use_polynomial,
+    curve_shift=curve_shift,
+    curve_distortion=curve_distortion,
+    bih_share=bih_pct,
+    domestic_production=production_mcm,
+)
+balance_validation = demand.validate_balance_for_plot(balance, today_ts)
+
+
+# -----------------------------------------------------------------------------
+# Tabs
+# -----------------------------------------------------------------------------
+
+tab_balance, tab_flows, tab_capacity, tab_model = st.tabs(
+    ["📊 Gas Balance", "🔁 Flow Details", "📋 Capacity Bookings", "🧮 Model & Assumptions"],
+)
 
 
 # =============================================================================
-# Legacy helpers (uploaded-CSV flow + charts.py compatibility)
+# TAB 1 — GAS BALANCE
 # =============================================================================
-
-def empty_capacity_frame() -> pd.DataFrame:
-    cols = [
-        "tso", "border_point", "border_point_full", "border_point_short",
-        "direction", "product", "auction_product_type",
-        "period", "delivery_period", "delivery_sort",
-        "period_start", "period_end", "period_days",
-        "offered_mwh", "booked_mwh", "utilisation_pct",
-        "offered_capacity_mwh_day", "booked_capacity_mwh_day",
-        "booked_percentage", "price_original", "price_currency",
-        "price_unit_detected", "price_eur_per_mwh",
-        "data_quality_warning", "has_quality_warning",
-        "source_retrieval_date",
-    ]
-    return pd.DataFrame(columns=cols)
-
-
-def border_point_short_name(border_point: Any, direction: Any = None) -> str:
-    if border_point is None or (isinstance(border_point, float) and np.isnan(border_point)):
-        full = ""
+with tab_balance:
+    # KPI row — pick the "today" row (or middle of range if today is outside)
+    today_row = balance[balance["date"] == today_ts]
+    if today_row.empty:
+        kpi_row = balance.iloc[len(balance) // 2]
     else:
-        full = str(border_point).strip()
-    if full in BORDER_POINT_SHORT_NAMES:
-        return BORDER_POINT_SHORT_NAMES[full]
-    compact = re.sub(r"\s*\([^)]*\)", "", full).strip()
-    if compact in BORDER_POINT_SHORT_NAMES:
-        return BORDER_POINT_SHORT_NAMES[compact]
-    return compact[:24] + "..." if len(compact) > 27 else compact
+        kpi_row = today_row.iloc[0]
 
-
-def read_uploaded(upload: Union[IO, bytes]) -> pd.DataFrame:
-    """Parse an uploaded CSV/XLSX of capacity bookings."""
-    name = getattr(upload, "name", "")
-    if name.lower().endswith((".xlsx", ".xls")):
-        df = pd.read_excel(upload)
-    else:
-        df = pd.read_csv(upload)
-    df.columns = [str(c).strip() for c in df.columns]
-    return df
-
-
-COLUMN_ALIASES = {
-    "tso": ["tso", "operator", "transmission system operator"],
-    "border_point": [
-        "border point", "border_point", "point", "interconnection point", "pointlabel",
-    ],
-    "direction": ["type", "direction", "entry/exit", "directionkey"],
-    "product": [
-        "product", "product type", "auction product type", "auction_product_type", "runtime period",
-    ],
-    "period": ["period", "delivery period", "gas day", "date"],
-    "offered_mwh": [
-        "offered (mwh/day)", "offered (mwh/d)", "offered (kwh/h)", "offered (kwh/day)",
-        "offered", "offered_mwh", "offered capacity", "offered_capacity_mwh_day",
-        "offered_capacity",
-    ],
-    "booked_mwh": [
-        "booked (mwh/day)", "booked (mwh/d)", "booked (kwh/h)", "booked (kwh/day)",
-        "booked", "booked_mwh", "booked capacity", "booked_capacity_mwh_day",
-        "booked_capacity",
-    ],
-    "utilisation_pct": [
-        "booked %", "booked%", "utilisation_pct", "utilization_pct", "utilisation",
-    ],
-    "price": ["price", "reserve price", "tariff"],
-    "currency": ["currency", "ccy"],
-    "price_unit": ["price unit", "unit", "price_unit"],
-    "source_timestamp": [
-        "source timestamp", "retrieval date", "retrieved at",
-        "created at", "updated at", "timestamp",
-    ],
-}
-
-
-def _clean_col_key(s: Any) -> str:
-    return re.sub(r"\s+", " ", str(s).strip().lower())
-
-
-def _first_present(df: pd.DataFrame, aliases: list[str]) -> Optional[str]:
-    lookup = {_clean_col_key(c): c for c in df.columns}
-    for a in aliases:
-        if a in lookup:
-            return lookup[a]
-    return None
-
-
-def prepare_chart_data(
-    df: pd.DataFrame, fx_rates: Optional[dict[str, Any]] = None,
-) -> pd.DataFrame:
-    """Normalize a free-form capacity bookings frame (e.g. uploaded CSV)."""
-    if df is None or df.empty:
-        return empty_capacity_frame()
-
-    out = pd.DataFrame(index=df.index)
-    src_cols: dict[str, Optional[str]] = {}
-    for target, aliases in COLUMN_ALIASES.items():
-        src = _first_present(df, aliases)
-        src_cols[target] = src
-        out[target] = df[src] if src else np.nan
-
-    out["tso"] = out["tso"].fillna("").astype(str).str.strip()
-    out["border_point_full"] = out["border_point"].fillna("").astype(str).str.strip()
-    out["direction"] = out["direction"].fillna("").astype(str).str.strip().str.lower()
-    out["border_point_short"] = [
-        border_point_short_name(bp, d)
-        for bp, d in zip(out["border_point_full"], out["direction"])
-    ]
-    out["product"] = out["product"].fillna("").astype(str).str.strip().str.lower()
-    out["period"] = out["period"].fillna("").astype(str).str.strip()
-
-    out["offered_mwh"] = out["offered_mwh"].map(_to_number)
-    out["booked_mwh"] = out["booked_mwh"].map(_to_number)
-    out["utilisation_pct"] = out["utilisation_pct"].map(_to_number)
-    derive = (
-        out["utilisation_pct"].isna()
-        & (out["offered_mwh"].fillna(0) > 0)
-        & out["booked_mwh"].notna()
+    # First row of KPIs
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Forecasted demand", f"{kpi_row['demand_mcm']:,.2f} mcm/d")
+    k2.metric("Available for Serbia", f"{kpi_row['serbian_available_supply_mcm']:,.2f} mcm/d")
+    storage_val = kpi_row["storage_imbalance_mcm"]
+    k3.metric(
+        "Storage +/-",
+        f"{storage_val:+,.2f} mcm/d",
+        delta="Injection" if storage_val >= 0 else "Withdrawal",
+        delta_color="normal" if storage_val >= 0 else "inverse",
     )
-    out.loc[derive, "utilisation_pct"] = (
-        out.loc[derive, "booked_mwh"] / out.loc[derive, "offered_mwh"] * 100.0
-    )
-    out["offered_capacity_mwh_day"] = out["offered_mwh"]
-    out["booked_capacity_mwh_day"] = out["booked_mwh"]
-    out["booked_percentage"] = out["utilisation_pct"]
-
-    def _norm_prod(p: Any) -> str:
-        p = str(p or "").lower()
-        if "year" in p:
-            return "yearly"
-        if "quarter" in p:
-            return "quarterly"
-        if "month" in p:
-            return "monthly"
-        if "day" in p:
-            return "daily"
-        return p or "daily"
-    out["auction_product_type"] = out["product"].map(_norm_prod)
-
-    if "price" in out.columns:
-        out["price_original"] = out["price"].map(_to_number)
-    else:
-        out["price_original"] = np.nan
-    out["price_currency"] = (
-        out["currency"].fillna("").astype(str).str.upper().str.strip()
-        if "currency" in out.columns else ""
-    )
-    out["price_unit_detected"] = (
-        out["price_unit"].fillna("").astype(str).str.strip()
-        if "price_unit" in out.columns else ""
+    k4.metric(
+        "Belgrade temp",
+        f"{kpi_row['temperature_c']:.1f} °C",
+        delta=f"avg: {kpi_row['avg_temperature_c']:.1f} °C",
     )
 
-    rates = (fx_rates or {}).get("rates") if fx_rates else None
-    if rates:
-        def _to_eur(price, ccy):
-            if pd.isna(price) or not ccy:
-                return np.nan
-            ccy = str(ccy).upper().strip()
-            if ccy == "EUR":
-                return float(price)
-            rate = rates.get(ccy)
-            if rate and rate > 0:
-                return float(price) / rate
-            return np.nan
-        out["price_eur_per_mwh"] = [
-            _to_eur(p, c) for p, c in zip(out["price_original"], out["price_currency"])
-        ]
-    else:
-        out["price_eur_per_mwh"] = np.nan
+    # Second row of KPIs
+    k5, k6, k7, k8 = st.columns(4)
+    k5.metric("Import from HU (Kiskundorozsma)", f"{kpi_row['kiskundorozsma_entry_mcm']:,.2f} mcm/d")
+    k6.metric(
+        "Imports from Bulgaria",
+        f"{kpi_row['imports_from_bulgaria_mcm']:,.2f} mcm/d",
+        delta=f"net: {kpi_row['imports_from_bulgaria_available_mcm']:,.2f} mcm/d",
+    )
+    k7.metric("Kalotina entry", f"{kpi_row['kalotina_entry_mcm']:,.2f} mcm/d")
+    k8.metric("Domestic production", f"{kpi_row['domestic_production_mcm']:,.2f} mcm/d")
 
-    out["delivery_period"] = out["period"]
-    out["delivery_sort"] = pd.to_datetime(out["period"], errors="coerce")
-    out["period_start"] = out["delivery_sort"]
-    out["period_end"] = out["delivery_sort"]
-    out["period_days"] = 1
-
-    if src_cols.get("source_timestamp"):
-        out["source_retrieval_date"] = df[src_cols["source_timestamp"]].astype(str)
-    else:
-        out["source_retrieval_date"] = ""
-
-    out["data_quality_warning"] = ""
-    out["has_quality_warning"] = False
-    return out
-
-
-def run_data_quality_checks(df: pd.DataFrame) -> dict[str, Any]:
-    quality: dict[str, Any] = {
-        "warnings": [],
-        "row_count": int(len(df)) if df is not None else 0,
-    }
-    if df is None or df.empty:
-        return quality
-    if "offered_mwh" in df.columns and "booked_mwh" in df.columns:
-        bad = (df["offered_mwh"].fillna(0) > 0) & df["booked_mwh"].isna()
-        if bad.any():
-            quality["warnings"].append(
-                f"{int(bad.sum())} rows have offered > 0 but no booked value."
-            )
-    if "utilisation_pct" in df.columns:
-        over = df["utilisation_pct"].fillna(0) > 100.0
-        if over.any():
-            quality["warnings"].append(
-                f"{int(over.sum())} rows show utilisation > 100% (re-auctioned?)."
-            )
-    return quality
-
-
-def attach_quality_warnings(
-    df: pd.DataFrame, quality: dict[str, Any],
-) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    if "data_quality_warning" not in df.columns:
-        df["data_quality_warning"] = ""
-    if "utilisation_pct" in df.columns:
-        over = df["utilisation_pct"].fillna(0) > 100.0
-        df.loc[over, "data_quality_warning"] = (
-            df.loc[over, "data_quality_warning"].astype(str) + "utilisation>100%; "
+    # Third KPI row — Bosnia export
+    k9, _, _, _ = st.columns(4)
+    k9.metric(
+        "Bosnia consumption/export",
+        f"{kpi_row['bosnia_consumption_mcm']:,.2f} mcm/d",
+        delta=f"{bih_pct_percent:.1f}% of BG import",
+    )
+    if bool(kpi_row.get("is_current_day_estimate", False)):
+        st.caption(
+            "Today uses previous-day ENTSOG values for: "
+            f"{kpi_row['current_day_estimated_components']}."
         )
-    df["has_quality_warning"] = df["data_quality_warning"].astype(str).str.len() > 0
-    return df
 
+    st.markdown("")  # small gap
 
-def plotted_series_validation_table(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
-    keep = [
-        c for c in [
-            "tso", "border_point_full", "border_point_short", "direction",
-            "auction_product_type", "delivery_period",
-            "offered_capacity_mwh_day", "booked_capacity_mwh_day",
-            "booked_percentage", "price_original", "price_currency",
-            "price_unit_detected", "price_eur_per_mwh", "data_quality_warning",
-        ] if c in df.columns
-    ]
-    return df[keep].copy()
+    if show_debug_checks:
+        with st.expander("Debug data checks", expanded=False):
+            validation_cols = [
+                "date",
+                "imports_from_bulgaria_mcm",
+                "bosnia_consumption_pct",
+                "bosnia_consumption_mcm",
+                "imports_from_bulgaria_available_mcm",
+                "kalotina_entry_mcm",
+                "kiskundorozsma_entry_mcm",
+                "domestic_production_mcm",
+                "serbian_supply_before_bosnia_mcm",
+                "stacked_supply_total_mcm",
+                "serbian_available_supply_mcm",
+                "demand_mcm",
+                "storage_imbalance_raw_mcm",
+                "storage_injection_mcm",
+                "storage_withdrawal_mcm",
+                "storage_imbalance_mcm",
+                "is_current_day_estimate",
+                "current_day_estimated_components",
+                "required_actual_mcm",
+                "required_forecast_mcm",
+                "is_forecast",
+            ]
+            around_today = balance_validation["around_today"][validation_cols].copy()
+            around_today["date"] = around_today["date"].dt.strftime("%Y-%m-%d")
+            st.markdown("**Rows around highlighted day**")
+            st.dataframe(around_today, use_container_width=True, hide_index=True)
 
+            duplicate_dates = balance_validation["duplicate_dates"]
+            hist_fcst_overlap = balance_validation["hist_fcst_overlap"]
+            high_totals = balance_validation["high_totals"]
+            current_day_estimates = balance_validation["current_day_estimates"]
+            threshold = balance_validation["high_total_threshold"]
 
-# =============================================================================
-# Module self-check
-# =============================================================================
+            if duplicate_dates.empty and hist_fcst_overlap.empty:
+                st.success("No duplicate daily rows or historical/forecast demand overlaps detected.")
+            if not duplicate_dates.empty:
+                st.warning("Duplicate dates detected before plotting.")
+                dup_display = duplicate_dates[validation_cols].copy()
+                dup_display["date"] = dup_display["date"].dt.strftime("%Y-%m-%d")
+                st.dataframe(dup_display, use_container_width=True, hide_index=True)
+            if not hist_fcst_overlap.empty:
+                st.warning("Historical and forecast demand both exist on the same date.")
+                overlap_display = hist_fcst_overlap[validation_cols].copy()
+                overlap_display["date"] = overlap_display["date"].dt.strftime("%Y-%m-%d")
+                st.dataframe(overlap_display, use_container_width=True, hide_index=True)
+            if not high_totals.empty:
+                st.warning(
+                    "Stacked supply totals exceed the rolling sanity threshold "
+                    f"({threshold:.2f} mcm/day)."
+                )
+                high_display = high_totals[validation_cols].copy()
+                high_display["date"] = high_display["date"].dt.strftime("%Y-%m-%d")
+                st.dataframe(high_display, use_container_width=True, hide_index=True)
+            if not current_day_estimates.empty:
+                st.info("Current-day ENTSOG estimate applied.")
+                estimate_display = current_day_estimates[validation_cols].copy()
+                estimate_display["date"] = estimate_display["date"].dt.strftime("%Y-%m-%d")
+                st.dataframe(estimate_display, use_container_width=True, hide_index=True)
 
-if __name__ == "__main__":  # pragma: no cover
-    import sys
-    yr = int(sys.argv[1]) if len(sys.argv) > 1 else (date.today().year - 1)
-    print(f"[capacity] Fetching ENTSOG cross-border capacity for year={yr} ...")
-    df, q = fetch_entsog_cross_border_capacity_year(yr)
-    print(f"  records: {len(df)}")
-    print(f"  matched pointDirections: {q['matched_point_directions']}")
-    print(f"  api_errors: {q['api_errors'][:3]}")
-    print(f"  missing_points: {q['missing_points']}")
-    print(f"  missing_products: {q['missing_products']}")
-    if not df.empty:
-        sample_cols = [
-            "_canonical_label", "direction", "auction_product_type",
-            "date_from", "date_to", "technical_capacity", "booked_capacity",
-            "available_capacity", "unit",
+    # ---- Three compact, vertically-aligned charts -------------------------
+    st.markdown("### Daily composition of Serbia demand")
+    st.plotly_chart(
+        charts.plot_gas_balance_chart(balance, today_ts),
+        use_container_width=True,
+        config={"displayModeBar": False},
+    )
+    st.markdown("### Belgrade temperature (°C)")
+    st.plotly_chart(
+        charts.plot_temperature_chart(balance, today_ts),
+        use_container_width=True,
+        config={"displayModeBar": False},
+    )
+    st.markdown("### Storage +/-")
+    st.plotly_chart(
+        charts.plot_storage_chart(balance, today_ts),
+        use_container_width=True,
+        config={"displayModeBar": False},
+    )
+
+    with st.expander("📄 Show daily balance table"):
+        show_cols = [
+            "date",
+            "temperature_c",
+            "avg_temperature_c",
+            "demand_mcm",
+            "imports_from_bulgaria_mcm",
+            "bosnia_consumption_pct",
+            "bosnia_consumption_mcm",
+            "imports_from_bulgaria_available_mcm",
+            "kalotina_entry_mcm",
+            "kiskundorozsma_entry_mcm",
+            "domestic_production_mcm",
+            "serbian_supply_before_bosnia_mcm",
+            "serbian_available_supply_mcm",
+            "storage_imbalance_raw_mcm",
+            "storage_injection_mcm",
+            "storage_withdrawal_mcm",
+            "storage_imbalance_mcm",
+            "unserved_deficit_after_storage_limit_mcm",
+            "uncaptured_surplus_after_storage_limit_mcm",
+            "is_current_day_estimate",
+            "current_day_estimated_components",
+            "is_forecast",
         ]
-        sample_cols = [c for c in sample_cols if c in df.columns]
-        print(df[sample_cols].head(10).to_string(index=False))
+        display = balance[show_cols].copy()
+        display["date"] = display["date"].dt.strftime("%Y-%m-%d")
+        st.dataframe(display, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download balance as CSV",
+            data=balance[show_cols].to_csv(index=False).encode("utf-8"),
+            file_name="serbia_gas_balance.csv",
+            mime="text/csv",
+        )
+
+
+# =============================================================================
+# TAB 2 — FLOW DETAILS
+# =============================================================================
+with tab_flows:
+    st.subheader("Physical flows by point")
+    st.caption(
+        "Daily allocations at each ENTSOG point in mcm/day. "
+        "Note: *Import from BG (net)* = Kireevo − Kiskundorozsma-2."
+    )
+
+    # Plot only the 4 canonical points (skip MET sub-split here)
+    flow_plot_df = flow_df[["date", "kiskundorozsma_hu", "kireevo", "kiskundorozsma_2", "kalotina"]]
+    st.plotly_chart(
+        charts.plot_flow_details_chart(flow_plot_df, today_ts, POINTS),
+        use_container_width=True,
+        config={"displayModeBar": False},
+    )
+
+    cols = st.columns(2)
+    with cols[0]:
+        st.markdown("**Raw flow data (mcm/d)**")
+        st.dataframe(
+            flow_df.assign(date=flow_df["date"].dt.strftime("%Y-%m-%d")),
+            use_container_width=True, hide_index=True,
+        )
+    with cols[1]:
+        st.markdown("**Unit conversion**")
+        st.dataframe(
+            pd.DataFrame(
+                {
+                    "From": ["MWh/day", "kWh/day", "GWh/day", "mcm/day"],
+                    "To":   ["mcm/day", "mcm/day", "mcm/day", "GWh/day"],
+                    "Factor": ["÷ 10,550", "÷ 10,550,000", "÷ 10.55", "× 10.55"],
+                    "Basis": ["1 mcm = 10.55 GWh"] * 4,
+                }
+            ),
+            hide_index=True, use_container_width=True,
+        )
+
+
+# =============================================================================
+# TAB 3 — CAPACITY BOOKINGS
+# =============================================================================
+with tab_capacity:
+    st.subheader("Cross-border capacity bookings")
+    st.caption("Full-year ENTSOG capacity module (Jan 1 to Dec 31) with product split and quality diagnostics.")
+
+    selected_year = st.selectbox("Year", options=list(range(today.year - 3, today.year + 2)), index=3)
+    gcv_kwh_per_m3 = st.number_input("GCV (kWh/m3)", min_value=1.0, max_value=20.0, value=10.55, step=0.01)
+    unit_filter = st.selectbox("Unit", ["mcm/day", "native ENTSOG unit"], index=0)
+    if st.button("Refresh ENTSOG data"):
+        st.cache_data.clear()
+
+    @st.cache_data(ttl=60 * 30)
+    def _load_cross_border_year(y: int, unit_name: str, gcv: float):
+        preferred = "mcm/day" if unit_name == "mcm/day" else "native"
+        return capacity.fetch_entsog_cross_border_capacity_year(y, preferred_unit=preferred, gcv_kwh_per_m3=gcv)
+
+    cap_year_df, cap_year_quality = _load_cross_border_year(selected_year, unit_filter, gcv_kwh_per_m3)
+
+    if cap_year_df.empty:
+        st.error("No ENTSOG cross-border capacity booking data returned for the selected year.")
+        if cap_year_quality.get("api_errors"):
+            st.dataframe(pd.DataFrame({"api_error": cap_year_quality["api_errors"]}), use_container_width=True, hide_index=True)
+        st.stop()
+
+    point_values = sorted(cap_year_df["_canonical_label"].dropna().astype(str).unique().tolist())
+    country_pair_values = sorted(cap_year_df["country_pair"].dropna().astype(str).unique().tolist())
+    direction_values = sorted(cap_year_df["direction"].dropna().astype(str).unique().tolist())
+    product_values = ["all", "yearly", "quarterly", "monthly", "daily"]
+
+    f1, f2, f3 = st.columns(3)
+    with f1:
+        selected_points = st.multiselect("Border point", point_values, default=point_values)
+    with f2:
+        selected_pairs = st.multiselect("Country pair", country_pair_values, default=country_pair_values)
+    with f3:
+        selected_directions = st.multiselect("Direction", direction_values, default=direction_values)
+    selected_product = st.radio("Auction product type", product_values, index=0, horizontal=True)
+
+    view = cap_year_df[
+        cap_year_df["_canonical_label"].isin(selected_points)
+        & cap_year_df["country_pair"].isin(selected_pairs)
+        & cap_year_df["direction"].isin(selected_directions)
+    ].copy()
+    if selected_product != "all":
+        view = view[view["auction_product_type"] == selected_product].copy()
+
+    # Summary cards
+    total_technical = pd.to_numeric(view.get("technical_capacity", pd.Series(dtype=float)), errors="coerce").sum(skipna=True)
+    total_booked = pd.to_numeric(view.get("booked_capacity", pd.Series(dtype=float)), errors="coerce").sum(skipna=True)
+    avg_booked_pct = pd.to_numeric(view.get("booked_pct_of_technical", pd.Series(dtype=float)), errors="coerce").mean(skipna=True)
+    active_points = view["_canonical_label"].nunique()
+    missing_warn = int((view["warning"].astype(str).str.len() > 0).sum())
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Total technical capacity", f"{total_technical:,.2f}")
+    k2.metric("Total booked capacity", f"{total_booked:,.2f}")
+    k3.metric("Average booked %", f"{avg_booked_pct:,.2f}%" if pd.notna(avg_booked_pct) else "n/a")
+    k4.metric("Active points", f"{active_points}")
+    k5.metric("Missing/warning rows", f"{missing_warn}")
+    st.caption(f"Displayed unit: {view['unit'].iloc[0] if not view.empty else 'n/a'}")
+
+    # Heat map: time vs point+direction+product, color booked %
+    heat = view.copy()
+    heat["axis_y"] = heat["_canonical_label"] + " | " + heat["direction"] + " | " + heat["auction_product_type"]
+    heat["period_label"] = heat["gas_day"].dt.strftime("%Y-%m-%d")
+    heat_fig = px.density_heatmap(
+        heat,
+        x="period_label",
+        y="axis_y",
+        z="booked_pct_of_technical",
+        color_continuous_scale="Blues",
+        title="Booked Capacity Heat Map (% of technical)",
+        labels={"period_label": "Time period", "axis_y": "Point | direction | product", "booked_pct_of_technical": "Booked %"},
+        hover_data={
+            "_canonical_label": True,
+            "direction": True,
+            "auction_product_type": True,
+            "technical_capacity": ":.4f",
+            "booked_capacity": ":.4f",
+            "booked_pct_of_technical": ":.2f",
+            "available_capacity": ":.4f",
+            "unit": True,
+        },
+    )
+    st.plotly_chart(heat_fig, use_container_width=True, config={"displayModeBar": False})
+
+    # Line/area by product
+    view["series"] = view["_canonical_label"] + " | " + view["direction"] + " | " + view["auction_product_type"]
+    product_modes = st.radio("Time chart mode", ["line", "stacked area"], horizontal=True)
+    if product_modes == "stacked area":
+        ts_fig = px.area(
+            view.sort_values("gas_day"),
+            x="gas_day",
+            y="booked_capacity",
+            color="series",
+            title="Booked Capacity Over Time (by point and product)",
+        )
+    else:
+        ts_fig = px.line(
+            view.sort_values("gas_day"),
+            x="gas_day",
+            y="booked_capacity",
+            color="series",
+            title="Booked Capacity Over Time (by point and product)",
+        )
+    st.plotly_chart(ts_fig, use_container_width=True, config={"displayModeBar": False})
+
+    # Regional map
+    map_points = {
+        "Kiskundorozsma-2 (HU) / Horgos (RS)": {"lat": 46.18, "lon": 19.98, "route": "HU>RS"},
+        "Kiskundorozsma (HU > RS)": {"lat": 46.22, "lon": 19.97, "route": "HU>RS"},
+        "Kalotina (BG) / Dimitrovgrad (RS)": {"lat": 43.04, "lon": 22.89, "route": "BG>RS"},
+        "Kireevo/Kirevo (BG) / Zajecar (RS)": {"lat": 43.77, "lon": 22.22, "route": "BG>RS"},
+    }
+    latest_by_point = (
+        view.sort_values("gas_day")
+        .groupby("_canonical_label", as_index=False)
+        .tail(1)
+    )
+    map_rows = []
+    for _, r in latest_by_point.iterrows():
+        key = r["_canonical_label"]
+        if key not in map_points:
+            continue
+        geo = map_points[key]
+        map_rows.append(
+            {
+                "point": key,
+                "lat": geo["lat"],
+                "lon": geo["lon"],
+                "route": geo["route"],
+                "direction": r["direction"],
+                "technical_capacity": r.get("technical_capacity"),
+                "booked_capacity": r.get("booked_capacity"),
+                "booked_pct": r.get("booked_pct_of_technical"),
+            }
+        )
+    map_df = pd.DataFrame(map_rows)
+    if not map_df.empty:
+        mfig = px.scatter_geo(
+            map_df,
+            lat="lat",
+            lon="lon",
+            color="route",
+            symbol="route",
+            scope="europe",
+            hover_name="point",
+            hover_data={
+                "route": True,
+                "direction": True,
+                "technical_capacity": ":.4f",
+                "booked_capacity": ":.4f",
+                "booked_pct": ":.2f",
+            },
+            title="Regional Cross-Border Points (Serbia-Hungary-Bulgaria)",
+        )
+        # pipeline-style links
+        line_color = "#2E4F7F"
+        mfig.add_trace(
+            go.Scattergeo(
+                lon=[19.97, 20.46, None, 22.89, 21.90, None, 22.22, 21.90],
+                lat=[46.22, 45.27, None, 43.04, 43.32, None, 43.77, 43.32],
+                mode="lines",
+                line=dict(width=2, color=line_color),
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
+        mfig.update_geos(
+            lataxis_range=[41.5, 47.8],
+            lonaxis_range=[17.5, 25.5],
+            showcountries=True,
+            countrycolor="rgba(80,80,80,0.5)",
+            showland=True,
+            landcolor="rgb(242,245,250)",
+        )
+        st.plotly_chart(mfig, use_container_width=True, config={"displayModeBar": False})
+
+    st.markdown("### Capacity booking table")
+    table_cols = [
+        "date_from",
+        "date_to",
+        "gas_day",
+        "country_from",
+        "country_to",
+        "TSO",
+        "TSO_code",
+        "interconnection_point_name",
+        "interconnection_point_code",
+        "direction",
+        "auction_product_type",
+        "technical_capacity",
+        "offered_capacity",
+        "booked_capacity",
+        "available_capacity",
+        "unit",
+        "source_url",
+        "query_metadata",
+        "warning",
+    ]
+    present_cols = [c for c in table_cols if c in view.columns]
+    st.dataframe(view[present_cols], use_container_width=True, hide_index=True)
+
+    st.download_button(
+        "Download ENTSOG capacity table (CSV)",
+        data=view[present_cols].to_csv(index=False).encode("utf-8"),
+        file_name=f"entsog_cross_border_capacity_{selected_year}.csv",
+        mime="text/csv",
+    )
+
+    st.markdown("### Debug / Data quality panel")
+    dq_items = [
+        {"metric": "last successful fetch", "value": cap_year_quality.get("last_successful_fetch", "")},
+        {"metric": "records fetched", "value": cap_year_quality.get("records_fetched", 0)},
+        {"metric": "missing points", "value": ", ".join(cap_year_quality.get("missing_points", []))},
+        {"metric": "missing products", "value": " | ".join(cap_year_quality.get("missing_products", []))},
+        {"metric": "api errors", "value": len(cap_year_quality.get("api_errors", []))},
+        {"metric": "matched pointDirections", "value": ", ".join(cap_year_quality.get("matched_point_directions", []))},
+    ]
+    st.dataframe(pd.DataFrame(dq_items), use_container_width=True, hide_index=True)
+    if cap_year_quality.get("api_errors"):
+        st.warning("API errors occurred during ENTSOG fetch.")
+        st.dataframe(pd.DataFrame({"api_error": cap_year_quality["api_errors"]}), use_container_width=True, hide_index=True)
+    if cap_year_quality.get("data_warnings"):
+        st.warning("Data warnings were detected.")
+        st.dataframe(pd.DataFrame({"warning": cap_year_quality["data_warnings"]}), use_container_width=True, hide_index=True)
+    with st.expander("Query URLs used", expanded=False):
+        urls = cap_year_quality.get("query_urls", [])
+        st.dataframe(pd.DataFrame({"url": urls}), use_container_width=True, hide_index=True)
+
+
+# =============================================================================
+# TAB 4 — MODEL & ASSUMPTIONS
+# =============================================================================
+with tab_model:
+    st.subheader("Regression model")
+
+    cA, cB = st.columns(2)
+    with cA:
+        st.markdown("**Polynomial regression (active)**")
+        st.latex(r"y = 0.0007\,x^{3} - 0.0188\,x^{2} - 0.3194\,x + 11.987")
+        st.write("y = Serbian daily demand (mcm/d), x = Belgrade 2-day avg temperature (°C).")
+        st.dataframe(
+            pd.DataFrame({"Term": ["x³", "x²", "x", "constant"], "Coefficient": list(poly_coeffs)}),
+            hide_index=True, use_container_width=True,
+        )
+    with cB:
+        st.markdown("**Linear regression (fallback)**")
+        st.latex(r"y = -0.354\,x + 11.396")
+        st.dataframe(
+            pd.DataFrame({"Term": ["x", "constant"], "Coefficient": list(linear_coeffs)}),
+            hide_index=True, use_container_width=True,
+        )
+
+    st.divider()
+    st.subheader("Assumptions")
+    st.dataframe(
+        pd.DataFrame(
+            {
+                "Parameter": [
+                    "Domestic Serbian production",
+                    "Bosnia consumption / export share",
+                    "Import from BG (net)",
+                    "Serbian available supply",
+                    "Storage balance / imbalance",
+                    "Energy conversion",
+                    "Curve shift",
+                    "Curve distortion",
+                ],
+                "Value": [
+                    f"{production_mcm:.2f} mcm/day",
+                    f"{bih_pct*100:.1f}% of Import from BG",
+                    "Kireevo − Kiskundorozsma-2",
+                    "KKD HU + Import BG + Kalotina + Production − Bosnia",
+                    "Available supply − Required demand",
+                    "1 mcm = 10.55 GWh",
+                    f"{curve_shift}",
+                    f"{curve_distortion}",
+                ],
+            }
+        ),
+        hide_index=True, use_container_width=True,
+    )
+
+    st.divider()
+    st.subheader("Temperature & demand series")
+    fc = balance[["date", "temperature_c", "avg_temperature_c", "demand_mcm", "is_forecast"]].copy()
+    fc["date"] = fc["date"].dt.strftime("%Y-%m-%d")
+    fc = fc.rename(
+        columns={
+            "temperature_c": "Temperature (°C)",
+            "avg_temperature_c": "2-day Avg Temp (°C)",
+            "demand_mcm": "Demand (mcm/d)",
+            "is_forecast": "Forecast?",
+        }
+    )
+    st.dataframe(fc, use_container_width=True, hide_index=True)
