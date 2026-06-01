@@ -1,14 +1,5 @@
 """
 Flow data loading and unit conversion.
-
-The canonical internal representation is:
-
-    date              datetime64[ns]
-    kiskundorozsma_hu  float (mcm/day)
-    kireevo            float (mcm/day)
-    kiskundorozsma_2   float (mcm/day)
-    kalotina           float (mcm/day)
-    [kiskundorozsma_hu_met]  optional float (mcm/day)
 """
 
 from __future__ import annotations
@@ -23,7 +14,6 @@ CANONICAL_POINTS = list(POINTS.keys())
 
 
 def _normalise_point_name(name: str) -> str:
-    """Map any incoming point label to one of the canonical keys."""
     s = str(name).lower().strip()
     s = s.replace("/", " ").replace("-", " ").replace("_", " ")
     if "kalotina" in s:
@@ -40,7 +30,6 @@ def _normalise_point_name(name: str) -> str:
 
 
 def read_uploaded(upload: Union[IO, bytes]) -> pd.DataFrame:
-    """Parse an uploaded CSV/XLSX of flow data; returns a wide frame in mcm/day."""
     name = getattr(upload, "name", "")
     if name.endswith(".xlsx") or name.endswith(".xls"):
         df = pd.read_excel(upload)
@@ -87,7 +76,7 @@ def read_uploaded(upload: Union[IO, bytes]) -> pd.DataFrame:
 
     for c in CANONICAL_POINTS:
         if c not in wide.columns:
-            wide[c] = 0.0
+            wide[c] = pd.NA
 
     cols_order = ["date"] + CANONICAL_POINTS + [
         c for c in wide.columns if c not in (["date"] + CANONICAL_POINTS)
@@ -95,58 +84,17 @@ def read_uploaded(upload: Union[IO, bytes]) -> pd.DataFrame:
     return wide[cols_order].sort_values("date").reset_index(drop=True)
 
 
-def _fill_today_from_recent_history(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    If today's row is missing, fill it from the most recent prior available day.
-
-    Rules:
-    - Only apply to today's row.
-    - Look back at most two calendar days.
-    - Fill only columns that are still missing for today.
-    - Never overwrite a real value already present for today.
-    - Never duplicate or append overlapping rows.
-    """
-    if df.empty:
-        return df
-
-    today = pd.Timestamp.today().normalize()
-    if today not in df.index:
-        return df
-
-    value_cols = [c for c in df.columns if c not in ("date",)]
-    if not value_cols:
-        return df
-
-    today_row = df.loc[today, value_cols]
-    if today_row.notna().all():
-        return df
-
-    for days_back in (1, 2):
-        candidate_day = today - pd.Timedelta(days=days_back)
-        if candidate_day not in df.index:
-            continue
-        candidate_row = df.loc[candidate_day, value_cols]
-        if candidate_row.isna().all():
-            continue
-        missing_mask = df.loc[today, value_cols].isna()
-        df.loc[today, value_cols] = df.loc[today, value_cols].where(
-            ~missing_mask,
-            candidate_row,
-        )
-        if df.loc[today, value_cols].notna().all():
-            break
-
-    return df
-
-
 def align(flow_df: pd.DataFrame, date_index: pd.DatetimeIndex) -> pd.DataFrame:
-    """Reindex flow data onto the master date_index with a limited today fallback."""
+    """
+    Reindex flow data onto the master date index.
+
+    Important:
+    - keep missing values as NaN instead of forcing zero
+    - keep one row per day only
+    - let the demand layer decide when a fallback is logically safe
+    """
     df = flow_df.copy()
     df["date"] = pd.to_datetime(df["date"]).dt.normalize()
     df = df.sort_values("date").groupby("date", as_index=False).last()
     df = df.set_index("date").reindex(pd.DatetimeIndex(date_index).normalize())
-
-    df = _fill_today_from_recent_history(df)
-    df = df.fillna(0.0)
-
     return df.reset_index().rename(columns={"index": "date"})

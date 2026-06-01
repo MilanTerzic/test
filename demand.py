@@ -1,34 +1,5 @@
 """
 Demand forecast and gas-balance calculation.
-
-Implements the model documented in
-`Serbian_natural_gas_balance_v8__Kalotina.xlsx` →
-sheet "Serbian Gas Cons. forecast":
-
-    Required (est.)        =  poly(avg_temp_C)        # mcm/day
-    Import from BG (net)   =  Kireevo - Kiskundorozsma_2
-    Bosnia consumption     =  bih_share × Import from BG (net)
-    Available supply       =  Kiskundorozsma_HU
-                              + Import from BG (net)
-                              + Kalotina
-                              + Production
-                              - Bosnia consumption
-    Storage +/-            =  Available supply - Required (est.)
-
-The output frame uses the explicit ``*_mcm`` column naming required by
-the dashboard layer:
-
-    kalotina_entry_mcm
-    kiskundorozsma_entry_mcm
-    imports_from_bulgaria_mcm   = kireevo_entry - kiskundorozsma_2_entry
-    domestic_production_mcm     = 0.5 mcm/day (configurable)
-    serbian_available_supply_mcm
-    required_actual_mcm
-    required_forecast_mcm
-    temperature_actual_c
-    temperature_forecast_c
-    bosnia_consumption_mcm      (kept for reference / KPI, not in main stack)
-    storage_imbalance_mcm
 """
 
 from __future__ import annotations
@@ -55,23 +26,19 @@ def forecast_demand(
     curve_shift: float = 0.0,
     curve_distortion: float = 1.0,
 ) -> pd.Series:
-    """Return Serbian daily demand in mcm/day."""
     x = temperature_c.astype(float)
     coeffs = poly_coeffs if use_polynomial else linear_coeffs
     base = pd.Series(np.polyval(list(coeffs), x), index=x.index)
-
-    if curve_distortion is None or curve_distortion == 0:
+    if curve_distortion in (None, 0):
         curve_distortion = 1.0
     return base * curve_distortion + curve_shift
 
 
 def rolling_avg_temperature(temp_series: pd.Series, window: int = 2) -> pd.Series:
-    """Workbook column 'Avg. Temp' is a simple 2-day rolling mean."""
     return temp_series.rolling(window=window, min_periods=1).mean()
 
 
 def _normalize_daily_index(date_index: pd.DatetimeIndex) -> pd.DatetimeIndex:
-    """Return one sorted midnight timestamp per dashboard date."""
     return (
         pd.DatetimeIndex(pd.to_datetime(date_index))
         .normalize()
@@ -81,11 +48,33 @@ def _normalize_daily_index(date_index: pd.DatetimeIndex) -> pd.DatetimeIndex:
 
 
 def _one_row_per_date(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize dates and keep one complete daily row if sources overlap."""
     out = df.copy()
     out["date"] = pd.to_datetime(out["date"]).dt.normalize()
     out = out.sort_values("date")
     return out.groupby("date", as_index=False).last()
+
+
+def _latest_valid_history_value(
+    frame: pd.DataFrame,
+    target_day: pd.Timestamp,
+    column: str,
+    max_days_back: int = 2,
+) -> float | None:
+    for days_back in range(1, max_days_back + 1):
+        candidate_day = target_day - pd.Timedelta(days=days_back)
+        if candidate_day not in frame.index:
+            continue
+        value = frame.at[candidate_day, column]
+        if pd.notna(value):
+            return float(value)
+    return None
+
+
+def _append_estimated_component(existing: str, component: str) -> str:
+    parts = [p.strip() for p in str(existing).split(",") if p.strip()]
+    if component not in parts:
+        parts.append(component)
+    return ", ".join(parts)
 
 
 def _apply_current_day_flow_estimate(
@@ -93,13 +82,6 @@ def _apply_current_day_flow_estimate(
     today_ts: pd.Timestamp,
     flow_columns: Sequence[str],
 ) -> pd.DataFrame:
-    """
-    Current-day ENTSOG daily data may be incomplete during the gas day.
-
-    If today's flow is missing, or is zero while yesterday had a positive
-    value, temporarily use yesterday's actual value for today only. Future
-    forecast days are deliberately left untouched.
-    """
     out = flow_aligned.copy()
     out["is_current_day_estimate"] = False
     out["current_day_estimated_components"] = ""
@@ -107,28 +89,18 @@ def _apply_current_day_flow_estimate(
     if today_ts not in out.index:
         return out
 
-    yesterday = today_ts - pd.Timedelta(days=1)
-    if yesterday not in out.index:
-        return out
-
     estimated_components: list[str] = []
     for col in flow_columns:
         if col not in out.columns:
             continue
-
         today_value = out.at[today_ts, col]
-        yesterday_value = out.at[yesterday, col]
-        yesterday_is_usable = pd.notna(yesterday_value) and float(yesterday_value) > 0.0
-        today_is_missing = pd.isna(today_value)
-        today_is_artificial_zero = (
-            pd.notna(today_value)
-            and float(today_value) == 0.0
-            and yesterday_is_usable
-        )
-
-        if yesterday_is_usable and (today_is_missing or today_is_artificial_zero):
-            out.at[today_ts, col] = yesterday_value
-            estimated_components.append(col)
+        if pd.notna(today_value):
+            continue
+        fallback = _latest_valid_history_value(out, today_ts, col, max_days_back=2)
+        if fallback is None:
+            continue
+        out.at[today_ts, col] = fallback
+        estimated_components.append(col)
 
     if estimated_components:
         out.at[today_ts, "is_current_day_estimate"] = True
@@ -139,70 +111,54 @@ def _apply_current_day_flow_estimate(
     return out
 
 
-def _append_estimated_component(existing: str, component: str) -> str:
-    parts = [p.strip() for p in str(existing).split(",") if p.strip()]
-    if component not in parts:
-        parts.append(component)
-    return ", ".join(parts)
-
-
-def _apply_current_day_derived_estimate(
-    df: pd.DataFrame,
-    today_ts: pd.Timestamp,
-) -> pd.DataFrame:
-    """
-    Guard derived chart components against partial same-day ENTSOG reporting.
-
-    Kireevo and the Kiskundorozsma-2 deduction can publish at different times.
-    If today's net Bulgaria import is zero/missing, or jumps well above
-    yesterday's net value, use yesterday's final net value for today only.
-    """
+def _apply_current_day_derived_estimate(df: pd.DataFrame, today_ts: pd.Timestamp) -> pd.DataFrame:
     out = df.copy()
     today_mask = out["date"] == today_ts
-    yesterday_mask = out["date"] == today_ts - pd.Timedelta(days=1)
-    if not today_mask.any() or not yesterday_mask.any():
+    if not today_mask.any():
         return out
 
     today_idx = out.index[today_mask][0]
-    yesterday_idx = out.index[yesterday_mask][0]
 
-    def should_use_yesterday(col: str, spike_ratio: float = 1.5, spike_abs: float = 3.0) -> bool:
-        today_value = out.at[today_idx, col]
-        yesterday_value = out.at[yesterday_idx, col]
-        if pd.isna(yesterday_value) or float(yesterday_value) <= 0.0:
-            return False
-        if pd.isna(today_value) or float(today_value) == 0.0:
-            return True
-        return float(today_value) > max(
-            float(yesterday_value) * spike_ratio,
-            float(yesterday_value) + spike_abs,
-        )
+    def fallback_if_invalid(column: str, spike_ratio: float = 1.5, spike_abs: float = 3.0) -> None:
+        today_value = out.at[today_idx, column]
+        fallback = None
+        previous = None
+        for days_back in (1, 2):
+            candidate = today_ts - pd.Timedelta(days=days_back)
+            mask = out["date"] == candidate
+            if not mask.any():
+                continue
+            idx = out.index[mask][0]
+            value = out.at[idx, column]
+            if pd.notna(value):
+                if fallback is None:
+                    fallback = float(value)
+                if days_back == 1:
+                    previous = float(value)
+        if fallback is None:
+            return
 
-    if should_use_yesterday("imports_from_bulgaria_mcm"):
-        for col in [
-            "imports_from_bulgaria_mcm",
-            "bosnia_consumption_mcm",
-            "imports_from_bulgaria_available_mcm",
-        ]:
-            out.at[today_idx, col] = out.at[yesterday_idx, col]
-        out.at[today_idx, "is_current_day_estimate"] = True
-        out.at[today_idx, "current_day_estimated_components"] = (
-            _append_estimated_component(
-                out.at[today_idx, "current_day_estimated_components"],
-                "imports_from_bulgaria_mcm",
-            )
-        )
+        invalid = pd.isna(today_value)
+        if previous is not None and pd.notna(today_value):
+            invalid = float(today_value) > max(previous * spike_ratio, previous + spike_abs)
 
-    for col in ["kalotina_entry_mcm", "kiskundorozsma_entry_mcm"]:
-        if should_use_yesterday(col):
-            out.at[today_idx, col] = out.at[yesterday_idx, col]
+        if invalid:
+            out.at[today_idx, column] = fallback
             out.at[today_idx, "is_current_day_estimate"] = True
-            out.at[today_idx, "current_day_estimated_components"] = (
-                _append_estimated_component(
-                    out.at[today_idx, "current_day_estimated_components"],
-                    col,
-                )
+            out.at[today_idx, "current_day_estimated_components"] = _append_estimated_component(
+                out.at[today_idx, "current_day_estimated_components"],
+                column,
             )
+
+    for col in [
+        "imports_from_bulgaria_mcm",
+        "bosnia_consumption_mcm",
+        "imports_from_bulgaria_available_mcm",
+        "kalotina_entry_mcm",
+        "kiskundorozsma_entry_mcm",
+    ]:
+        if col in out.columns:
+            fallback_if_invalid(col)
 
     return out
 
@@ -222,13 +178,6 @@ def build_balance(
     max_storage_injection: float = 2.7,
     max_storage_withdrawal: float = 5.0,
 ) -> pd.DataFrame:
-    """
-    Build the daily Serbian gas balance frame on the master date_index.
-
-    All series are reindexed onto ``date_index`` so historical and forecast
-    rows live in one continuous frame with no gaps. Historical vs forecast
-    is decided by ``is_forecast = date > today_ts``.
-    """
     date_index = _normalize_daily_index(date_index)
     today_ts = pd.Timestamp(today_ts).normalize()
     temp_df = _one_row_per_date(temp_df)
@@ -236,18 +185,15 @@ def build_balance(
 
     df = pd.DataFrame({"date": date_index})
 
-    # ---- Temperature (single column actual+forecast; we split for plotting) --
     temp = temp_df.set_index("date").reindex(date_index)["temperature_c"]
     df["temperature_c"] = temp.values
     df["avg_temperature_c"] = rolling_avg_temperature(temp).values
 
     is_forecast = df["date"] > today_ts
     df["is_forecast"] = is_forecast.values
-
     df["temperature_actual_c"] = np.where(is_forecast, np.nan, df["temperature_c"])
     df["temperature_forecast_c"] = np.where(is_forecast, df["temperature_c"], np.nan)
 
-    # ---- Demand ------------------------------------------------------------
     demand = forecast_demand(
         df["avg_temperature_c"],
         poly_coeffs=poly_coeffs,
@@ -255,37 +201,30 @@ def build_balance(
         use_polynomial=use_polynomial,
         curve_shift=curve_shift,
         curve_distortion=curve_distortion,
-    )
-    demand = demand.values
+    ).values
     df["demand_mcm"] = demand
     df["required_actual_mcm"] = np.where(is_forecast, np.nan, demand)
     df["required_forecast_mcm"] = np.where(is_forecast, demand, np.nan)
 
-    # ---- Flows (already in mcm/day from the flows module) ------------------
     flow_columns = ["kireevo", "kiskundorozsma_2", "kalotina", "kiskundorozsma_hu"]
     flow_aligned = flow_df.set_index("date").reindex(date_index)
-    flow_aligned = _apply_current_day_flow_estimate(
-        flow_aligned=flow_aligned,
-        today_ts=today_ts,
-        flow_columns=flow_columns,
-    )
+    flow_aligned = _apply_current_day_flow_estimate(flow_aligned, today_ts, flow_columns)
     estimate_flags = flow_aligned[
         ["is_current_day_estimate", "current_day_estimated_components"]
     ].copy()
     flow_aligned = flow_aligned.drop(
         columns=["is_current_day_estimate", "current_day_estimated_components"]
-    ).fillna(0.0)
-    kkd_hu = flow_aligned.get("kiskundorozsma_hu", pd.Series(0.0, index=date_index))
-    kireevo = flow_aligned.get("kireevo", pd.Series(0.0, index=date_index))
-    kkd_2 = flow_aligned.get("kiskundorozsma_2", pd.Series(0.0, index=date_index))
-    kalotina = flow_aligned.get("kalotina", pd.Series(0.0, index=date_index))
+    )
+
+    kkd_hu = pd.to_numeric(flow_aligned.get("kiskundorozsma_hu"), errors="coerce")
+    kireevo = pd.to_numeric(flow_aligned.get("kireevo"), errors="coerce")
+    kkd_2 = pd.to_numeric(flow_aligned.get("kiskundorozsma_2"), errors="coerce")
+    kalotina = pd.to_numeric(flow_aligned.get("kalotina"), errors="coerce")
+
     imports_from_bulgaria = (kireevo - kkd_2.clip(lower=0.0)).clip(lower=0.0)
+    imports_from_bulgaria = imports_from_bulgaria.where(kireevo.notna() & kkd_2.notna())
     bosnia_consumption = (imports_from_bulgaria * float(bih_share)).clip(lower=0.0)
 
-    # ---- Four supply components (no MET / others split) -------------------
-    # kiskundorozsma_hu is the public HU>RS point-direction; if ENTSOG returns
-    # zero, the plotted component remains zero. Kiskundorozsma-2/Horgos is
-    # deducted from Kireevo before the Bosnia percentage is applied.
     df["kalotina_entry_mcm"] = kalotina.values
     df["kiskundorozsma_entry_mcm"] = kkd_hu.values
     df["imports_from_bulgaria_mcm"] = imports_from_bulgaria.values
@@ -299,17 +238,25 @@ def build_balance(
     df["current_day_estimated_components"] = estimate_flags[
         "current_day_estimated_components"
     ].values
+
     df = _apply_current_day_derived_estimate(df, today_ts)
 
-    df["serbian_supply_before_bosnia_mcm"] = (
-        df["imports_from_bulgaria_mcm"]
-        + df["kalotina_entry_mcm"]
-        + df["kiskundorozsma_entry_mcm"]
-        + df["domestic_production_mcm"]
-    )
-    df["serbian_available_supply_mcm"] = (
-        df["serbian_supply_before_bosnia_mcm"] - df["bosnia_consumption_mcm"]
-    )
+    df["serbian_supply_before_bosnia_mcm"] = df[
+        [
+            "imports_from_bulgaria_mcm",
+            "kalotina_entry_mcm",
+            "kiskundorozsma_entry_mcm",
+            "domestic_production_mcm",
+        ]
+    ].sum(axis=1, min_count=1)
+    df["serbian_available_supply_mcm"] = df[
+        [
+            "imports_from_bulgaria_available_mcm",
+            "kalotina_entry_mcm",
+            "kiskundorozsma_entry_mcm",
+            "domestic_production_mcm",
+        ]
+    ].sum(axis=1, min_count=1)
 
     df["storage_imbalance_raw_mcm"] = df["serbian_available_supply_mcm"] - df["demand_mcm"]
     capped_storage = df["storage_imbalance_raw_mcm"].clip(
@@ -335,27 +282,16 @@ def validate_balance_for_plot(
     high_total_multiplier: float = 1.6,
     lookaround_days: int = 3,
 ) -> dict:
-    """
-    Return lightweight diagnostics for the Streamlit debug panel.
-
-    The chart is daily and wide, so each date should appear once and each
-    row should belong to either the historical or forecast side, never both.
-    """
     check = df.copy()
     check["date"] = pd.to_datetime(check["date"]).dt.normalize()
     today_ts = pd.Timestamp(today_ts).normalize()
 
     components = [c for c in SUPPLY_COMPONENT_COLUMNS if c in check.columns]
-    check["stacked_supply_total_mcm"] = check[components].sum(axis=1)
+    check["stacked_supply_total_mcm"] = check[components].sum(axis=1, min_count=1)
 
-    duplicate_dates = (
-        check[check["date"].duplicated(keep=False)]
-        .sort_values("date")
-        .copy()
-    )
+    duplicate_dates = check[check["date"].duplicated(keep=False)].sort_values("date").copy()
     hist_fcst_overlap = check[
-        check["required_actual_mcm"].notna()
-        & check["required_forecast_mcm"].notna()
+        check["required_actual_mcm"].notna() & check["required_forecast_mcm"].notna()
     ].copy()
 
     median_total = check["stacked_supply_total_mcm"].median()
@@ -364,9 +300,7 @@ def validate_balance_for_plot(
         high_totals = check.iloc[0:0].copy()
     else:
         high_total_threshold = float(median_total * high_total_multiplier)
-        high_totals = check[
-            check["stacked_supply_total_mcm"] > high_total_threshold
-        ].copy()
+        high_totals = check[check["stacked_supply_total_mcm"] > high_total_threshold].copy()
 
     around_today = check[
         check["date"].between(
