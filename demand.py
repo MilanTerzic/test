@@ -256,8 +256,7 @@ def build_balance(
         curve_shift=curve_shift,
         curve_distortion=curve_distortion,
     )
-    # Operational floor: Required (FCTS) must never fall below 4 mcm/day.
-    demand = demand.clip(lower=4.0).values
+    demand = demand.values
     df["demand_mcm"] = demand
     df["required_actual_mcm"] = np.where(is_forecast, np.nan, demand)
     df["required_forecast_mcm"] = np.where(is_forecast, demand, np.nan)
