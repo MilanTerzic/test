@@ -1,129 +1,107 @@
-"""ENTSOG Transparency Platform fetcher for public daily operational flows."""
+"""
+Flow data loading and unit conversion.
+
+The canonical internal representation is:
+
+    date              datetime64[ns]
+    kiskundorozsma_hu  float (mcm/day)
+    kireevo            float (mcm/day)
+    kiskundorozsma_2   float (mcm/day)
+    kalotina           float (mcm/day)
+    [kiskundorozsma_hu_met]  optional float (mcm/day)
+"""
 
 from __future__ import annotations
 
-import time
-from datetime import date, timedelta
-from typing import Optional
+from typing import IO, Union
 
 import pandas as pd
-import requests
 
-from config import (
-    CONVERSION_MCM_TO_GWH,
-    CONVERSION_MCM_TO_KWH,
-    CONVERSION_MCM_TO_MWH,
-    ENTSOG_POINT_DIRECTIONS,
-)
+from config import CONVERSION_MCM_TO_MWH, POINTS
 
-BASE = "https://transparency.entsog.eu/api/v1"
+CANONICAL_POINTS = list(POINTS.keys())
 
 
-def _month_chunks(start: date, end: date):
-    """Yield monthly [start, end) windows so the API doesn't time out."""
-    cur = date(start.year, start.month, 1)
-    while cur <= end:
-        if cur.month == 12:
-            nxt = date(cur.year + 1, 1, 1)
+def _normalise_point_name(name: str) -> str:
+    """Map any incoming point label to one of the canonical keys."""
+    s = str(name).lower().strip()
+    s = s.replace("/", " ").replace("-", " ").replace("_", " ")
+    if "kalotina" in s:
+        return "kalotina"
+    if "kireevo" in s or "kireovo" in s or "kirevo" in s or "zaychar" in s:
+        return "kireevo"
+    if "kiskundorozsma" in s and ("2" in s or "ii" in s):
+        return "kiskundorozsma_2"
+    if "kiskundorozsma" in s and "met" in s:
+        return "kiskundorozsma_hu_met"
+    if "kiskundorozsma" in s:
+        return "kiskundorozsma_hu"
+    return s.replace(" ", "_")
+
+
+def read_uploaded(upload: Union[IO, bytes]) -> pd.DataFrame:
+    """Parse an uploaded CSV/XLSX of flow data; returns a wide frame in mcm/day."""
+    name = getattr(upload, "name", "")
+    if name.endswith(".xlsx") or name.endswith(".xls"):
+        df = pd.read_excel(upload)
+    else:
+        df = pd.read_csv(upload)
+
+    cols_lower = {c.lower(): c for c in df.columns}
+    if "point" in cols_lower:
+        # Long format
+        date_col = cols_lower.get("date", list(df.columns)[0])
+        point_col = cols_lower["point"]
+        if "mcm_per_day" in cols_lower:
+            value_col = cols_lower["mcm_per_day"]
+            factor = 1.0
+        elif "mwh_per_day" in cols_lower:
+            value_col = cols_lower["mwh_per_day"]
+            factor = 1 / CONVERSION_MCM_TO_MWH
         else:
-            nxt = date(cur.year, cur.month + 1, 1)
-        yield max(start, cur), min(end + timedelta(days=1), nxt)
-        cur = nxt
+            value_col = next(
+                c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])
+            )
+            factor = 1.0
 
-
-def _fetch_point(
-    pd_key: str,
-    start: date,
-    end: date,
-    token: Optional[str] = None,
-    indicator: str = "Physical Flow",
-) -> pd.DataFrame:
-    headers = {"User-Agent": "serbia-gas-dashboard/1.0"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-
-    rows: list[dict] = []
-    for win_start, win_end in _month_chunks(start, end):
-        params = {
-            "pointDirection": pd_key,
-            "from": win_start.isoformat(),
-            "to": win_end.isoformat(),
-            "indicator": indicator,
-            "periodType": "day",
-            "timezone": "CET",
-            "limit": -1,
-        }
-        r = requests.get(f"{BASE}/operationaldata", params=params, headers=headers, timeout=60)
-        if r.status_code == 404:
-            continue
-        r.raise_for_status()
-        payload = r.json()
-        records = (
-            payload.get("operationaldatas")
-            or payload.get("operationaldata")
-            or payload.get("data")
-            or []
-        )
-        if isinstance(records, list):
-            rows.extend(records)
-        time.sleep(0.1)
-    return pd.DataFrame(rows)
-
-
-def _value_to_mcm_per_day(value: float, unit: str) -> float:
-    """Convert ENTSOG daily energy units to mcm/day using the app-wide GCV."""
-    unit_clean = str(unit).lower().replace(" ", "")
-    if "gwh" in unit_clean:
-        return value / CONVERSION_MCM_TO_GWH
-    if "mwh" in unit_clean:
-        return value / CONVERSION_MCM_TO_MWH
-    if "kwh" in unit_clean:
-        return value / CONVERSION_MCM_TO_KWH
-    return value / CONVERSION_MCM_TO_KWH
-
-
-def fetch_flows(start: date, end: date, token: Optional[str] = None) -> pd.DataFrame:
-    """Fetch canonical public ENTSOG physical flows and return mcm/day."""
-    frames: list[pd.DataFrame] = []
-    for canonical, pd_key in ENTSOG_POINT_DIRECTIONS.items():
-        raw = _fetch_point(pd_key, start, end, token=token)
-        if raw.empty:
-            continue
-
-        period_col = next(
-            (c for c in raw.columns if c.lower() in ("periodfrom", "from", "period")),
-            None,
-        )
-        value_col = next((c for c in raw.columns if c.lower() == "value"), None)
-        unit_col = next((c for c in raw.columns if c.lower() == "unit"), None)
-        if period_col is None or value_col is None:
-            continue
-
-        df = pd.DataFrame(
+        long = pd.DataFrame(
             {
-                "date": (
-                    pd.to_datetime(raw[period_col], errors="coerce", utc=True)
-                    .dt.tz_convert("Europe/Belgrade")
-                    .dt.tz_localize(None)
-                    .dt.normalize()
-                ),
-                "value": pd.to_numeric(raw[value_col], errors="coerce"),
-                "unit": raw[unit_col].astype(str).str.lower() if unit_col else "kwh/d",
+                "date": pd.to_datetime(df[date_col]).dt.normalize(),
+                "point": df[point_col].map(_normalise_point_name),
+                "value": pd.to_numeric(df[value_col], errors="coerce") * factor,
             }
         ).dropna()
+        wide = long.pivot_table(
+            index="date", columns="point", values="value", aggfunc="sum"
+        ).reset_index()
+    else:
+        # Wide format
+        date_col = cols_lower.get("date", list(df.columns)[0])
+        wide = df.rename(columns={date_col: "date"}).copy()
+        wide["date"] = pd.to_datetime(wide["date"]).dt.normalize()
+        rename_map = {c: _normalise_point_name(c) for c in wide.columns if c != "date"}
+        wide = wide.rename(columns=rename_map)
 
-        df["mcm_per_day"] = [
-            _value_to_mcm_per_day(value, unit)
-            for value, unit in zip(df["value"], df["unit"])
-        ]
-        df = df.groupby("date", as_index=False)["mcm_per_day"].last()
-        df.rename(columns={"mcm_per_day": canonical}, inplace=True)
-        frames.append(df)
+        numeric_cols = [c for c in wide.columns if c != "date"]
+        if numeric_cols and wide[numeric_cols].abs().max().max() > 1000:
+            for c in numeric_cols:
+                wide[c] = wide[c] / CONVERSION_MCM_TO_MWH
 
-    if not frames:
-        raise RuntimeError("ENTSOG returned no data for any Serbian point in the requested range.")
+    for c in CANONICAL_POINTS:
+        if c not in wide.columns:
+            wide[c] = 0.0
 
-    out = frames[0]
-    for nxt in frames[1:]:
-        out = out.merge(nxt, on="date", how="outer")
-    return out.sort_values("date").reset_index(drop=True)
+    cols_order = ["date"] + CANONICAL_POINTS + [
+        c for c in wide.columns if c not in (["date"] + CANONICAL_POINTS)
+    ]
+    return wide[cols_order].sort_values("date").reset_index(drop=True)
+
+
+def align(flow_df: pd.DataFrame, date_index: pd.DatetimeIndex) -> pd.DataFrame:
+    """Reindex flow data onto the master date_index, filling gaps with 0."""
+    df = flow_df.copy()
+    df["date"] = pd.to_datetime(df["date"]).dt.normalize()
+    df = df.sort_values("date").groupby("date", as_index=False).last()
+    df = df.set_index("date").reindex(pd.DatetimeIndex(date_index).normalize())
+    df = df.fillna(0.0)
+    return df.reset_index().rename(columns={"index": "date"})
